@@ -1,14 +1,16 @@
 """Two-phase MTP finetune for Swift-27B — diverse, acceptance-optimized.
 
-Phase 1: load the FULL frozen main model on the free cards (2,3); run the diverse
-         TRAIN and VAL (eval) sets through it; save every (h_i, tok i+1, tok i+2)
-         triple (+ validity masks) to disk. h_i = post-final-norm hidden state.
-Phase 2: unload the main model; load embed_tokens + lm_head + MTP head on ONE card;
-         train the MTP head with CE + margin (acceptance-direct) loss; early-stop on
-         VAL acceptance (computed from the saved val h_i, no full model needed).
+PHASE 1 (MTP_PHASE=1): load the FULL frozen main model on the free cards (2,3);
+    run the diverse TRAIN and VAL (eval) sets through it; save every
+    (h_i, tok i+1, tok i+2) triple (+ validity masks) to disk. h_i = post-final-
+    norm hidden state. Exits, hard-releasing memory (malloc_trim) so the OS
+    reclaims it before phase 2.
+PHASE 2 (MTP_PHASE=2): load ONLY the saved hstore + embed_tokens + lm_head + the
+    MTP head on ONE card; train the MTP head with CE + margin (acceptance-direct)
+    loss; early-stop on VAL acceptance (computed from the saved val h_i).
 
-The margin loss pushes the true token's logit above the runner-up by MARGIN, which
-optimizes argmax acceptance directly (the metric we care about), not just CE.
+Run the two phases as SEPARATE processes (the launcher does this) so phase 1's
+large in-RAM model build is fully released before phase 2 allocates its own.
 
 Run under the RAM watchdog. ZE_AFFINITY_MASK=2,3; ONEAPI_DEVICE_SELECTOR unset.
 """
@@ -35,6 +37,7 @@ LR      = float(os.environ.get("MTP_LR", "1e-4"))
 MARGIN  = float(os.environ.get("MTP_MARGIN", "1.0"))
 LAMBDA  = float(os.environ.get("MTP_LAMBDA", "0.5"))
 PATIENCE = int(os.environ.get("MTP_PATIENCE", "3"))
+PHASE = int(os.environ.get("MTP_PHASE", "0"))  # 1 = harvest, 2 = train, 0 = both
 random.seed(0)
 
 def host_ram_free_gb():
@@ -87,23 +90,23 @@ def val_acceptance(head, hstore):
             t += int(valid.sum())
     return a / t if t else 0.0
 
-def main():
+def run_phase1():
     dev0 = "xpu:0"
     avail = host_ram_free_gb()
-    print(f"host RAM available: {avail}GB (safe threshold 30GB)", flush=True)
+    print(f"[phase1] host RAM available: {avail}GB (safe threshold 30GB)", flush=True)
     if avail < 30:
-        print("ABORT: host RAM < 30GB"); return
+        print("[phase1] ABORT: host RAM < 30GB"); return 1
+    if os.path.exists(HTRAIN) and os.path.exists(HVAL):
+        print("=== PHASE 1: skipping (hstores exist) ===", flush=True)
+        return 0
     cfg_full = Qwen3_5Config.from_pretrained(MODEL)
     cfg = cfg_full.text_config
     H = cfg.hidden_size
     tok = AutoTokenizer.from_pretrained(MODEL)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else 0
-
-    # ================= PHASE 1: harvest train + val h_i =================
-    if os.path.exists(HTRAIN) and os.path.exists(HVAL):
-        print(f"=== PHASE 1: skipping (hstores exist) ===", flush=True)
-    else:
-        print("=== PHASE 1: load full model on 2 cards, harvest train+val h_i ===", flush=True)
+    print("=== PHASE 1: load full model on 2 cards, harvest train+val h_i ===", flush=True)
+    model = text_model = final_norm = None
+    try:
         t0 = time.time()
         with init_empty_weights():
             model = Qwen3_5ForConditionalGeneration(cfg_full)
@@ -120,12 +123,25 @@ def main():
         torch.save(htrain, HTRAIN); torch.save(hval, HVAL)
         nt = sum(x[0].shape[0] for x in htrain); nv = sum(x[0].shape[0] for x in hval)
         print(f"phase1 done: {nt} train triples, {nv} val triples", flush=True)
-        del model, text_model, final_norm
-        torch.xpu.empty_cache(); import gc; gc.collect()
-        print(f"main model unloaded | host RAM now {host_ram_free_gb()}GB free", flush=True)
+        return 0
+    finally:
+        # hard-release: drop refs, empty GPU cache, trim glibc heap so the OS
+        # reclaims the memory before phase 2 (a separate process) starts.
+        try:
+            del model, text_model, final_norm
+            torch.xpu.empty_cache()
+            import gc; gc.collect()
+            import ctypes; ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception as e:
+            print(f"[phase1] cleanup note: {e}", flush=True)
+        print(f"[phase1] exited | host RAM now {host_ram_free_gb()}GB free", flush=True)
 
-    # ================= PHASE 2: train MTP head (CE + margin) =================
+def run_phase2():
+    dev0 = "xpu:0"
     print("=== PHASE 2: train MTP head on one card, early-stop on val ===", flush=True)
+    cfg_full = Qwen3_5Config.from_pretrained(MODEL)
+    cfg = cfg_full.text_config
+    H = cfg.hidden_size
     idx = json.load(open(os.path.join(MODEL, "model.safetensors.index.json")))["weight_map"]
     def load_tensor(name, dev):
         with safe_open(os.path.join(MODEL, idx[name]), "pt") as s:
@@ -150,6 +166,9 @@ def main():
     hval   = torch.load(HVAL)
     base_val = val_acceptance(head, hval)
     print(f"baseline val acceptance: {base_val:.4f}", flush=True)
+    os.makedirs(OUT, exist_ok=True)
+    with open(f"{OUT}/baseline_val_acc.txt", "w") as f:
+        f.write(f"{base_val:.6f}\n")
 
     best_val = base_val
     best_state = {k: v.detach().cpu() for k, v in head.state_dict().items()}
@@ -185,9 +204,22 @@ def main():
                 print(f"early stop at epoch {epoch} (no val gain for {PATIENCE} epochs)", flush=True)
                 break
 
-    os.makedirs(OUT, exist_ok=True)
     torch.save(best_state, f"{OUT}/mtp_head_final.pt")
+    with open(f"{OUT}/best_val_acc.txt", "w") as f:
+        f.write(f"{best_val:.6f}\n")
     print(f"DONE | best val acc {best_val:.4f} (baseline {base_val:.4f}) | saved {OUT}/mtp_head_final.pt", flush=True)
+    return 0
+
+def main():
+    if PHASE == 1:
+        sys.exit(run_phase1())
+    elif PHASE == 2:
+        sys.exit(run_phase2())
+    else:
+        rc = run_phase1()
+        if rc != 0:
+            sys.exit(rc)
+        sys.exit(run_phase2())
 
 if __name__ == "__main__":
     main()
