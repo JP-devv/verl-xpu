@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
-# Minimal isolated verl XPU SFT smoke test on cards 2,3 ONLY.
+# Minimal isolated verl XPU FSDP SFT smoke test on cards 2,3 ONLY.
 #
-# Purpose: prove the official verl-hardware-plugin end-to-end on the free pair —
+# Proves the official verl-hardware-plugin end-to-end on the free pair:
 #   1. get_platform() -> xpu/intel/xccl (plugin discovered),
 #   2. the FSDP XPU engine runs a real forward+backward+xccl-grad-sync on 2 cards,
 #   3. cards 0,1 (the serving lane) are never touched.
 #
-# Uses the tiny Qwen2.5-0.5B + a synthetic GSM8K-style parquet, so it is fast and
-# memory-trivial. eager attention (the only XPU-validated attention path).
+# Uses the tiny Qwen2.5-0.5B + a synthetic GSM8K-style parquet (fast, memory-trivial).
+# eager attention (the only XPU-validated attention path).
+#
+# VENV: defaults to the throwaway 2026 venv (.venv-xpu2026) whose oneCCL 2022.0.0
+# native-XCCL backend handles the FSDP many-reduce-scatter backward (the old
+# 2021.16.1/mpi stack in .venv crashes on it). Override with VENV=<path> to use
+# another venv. Native XCCL is launched with torchrun (no MPI bootstrap needed).
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd -- "$HERE/../.." && pwd)"
-VENV="$REPO/.venv"
+VENV="${VENV:-$REPO/.venv-xpu2026}"
 PY="$VENV/bin/python"
 
 # --- GPU pinning: ONLY the two free cards (2,3) ------------------------------
@@ -20,18 +25,9 @@ export ZE_AFFINITY_MASK="${ZE_AFFINITY_MASK:-2,3}"
 unset ONEAPI_DEVICE_SELECTOR            # must NOT be set alongside ZE_AFFINITY_MASK
 export VERL_PLATFORM=intel              # force the intel/xpu/xccl platform
 #
-# oneCCL (xccl) transport: this host has no usable OFI/RDMA provider (fi_getinfo
-# returns 0), so the default OFI transport fails to init. Force the MPI transport
-# instead. The venv bundles Intel MPI (IMPI); ONEAPI_ROOT points at it (satisfies
-# oneCCL's check_impi_env) and I_MPI_FABRICS=shm makes IMPI use shared memory for
-# this single-node run (no RDMA fabric). Processes are launched with mpiexec so
-# oneCCL gets a real MPI bootstrap (torchrun does not provide one).
-export CCL_ATL_TRANSPORT="${CCL_ATL_TRANSPORT:-mpi}"
-export ONEAPI_ROOT="${ONEAPI_ROOT:-$VENV}"
-export I_MPI_FABRICS="${I_MPI_FABRICS:-shm}"
-# B70 SYCL device-backend block: route large all-reduces over the DMA copy-engine
-# (not the deadlocking compute path). Validated by scripts/xpu/test_large_allreduce.py
-# (512MiB in 0.03s @ ~36GB/s). Needed once grad-sync tensors grow (real models).
+# Native XCCL (oneCCL 2022.0.0+): NO CCL_ATL_TRANSPORT / I_MPI_FABRICS — the native
+# backend handles the transport directly and is launched with torchrun. The B70 SYCL
+# device-backend block routes large collectives over the DMA copy-engine.
 export CCL_SYCL_COPY_ENGINE="${CCL_SYCL_COPY_ENGINE:-1}"
 export CCL_SYCL_ALLREDUCE_LL="${CCL_SYCL_ALLREDUCE_LL:-ring}"
 export CCL_SYCL_ALLREDUCE_SIMPLE_READ="${CCL_SYCL_ALLREDUCE_SIMPLE_READ:-1}"
@@ -58,11 +54,11 @@ assert (p.device_name, p.vendor_name, p.communication_backend_name()) == ("xpu",
 print("[preflight] OK")
 EOF
 
-# --- launch: 2-GPU FSDP SFT via mpiexec (oneCCL MPI transport) --------------
-# mpi-wrapper.sh maps IMPI's PMI_RANK/PMI_SIZE to torch.distributed's env:// vars
-# (RANK/WORLD_SIZE/LOCAL_RANK/MASTER_*), then execs the SFT trainer.
-exec "$VENV/bin/mpiexec" -n 2 \
-  bash "$HERE/mpi-wrapper.sh" \
+# --- launch: 2-GPU FSDP SFT via torchrun (native XCCL) -----------------------
+# NOTE: `torchrun ... -m module` — do NOT pass "$PY" as the first arg (torchrun
+# prepends sys.executable itself, which would make the worker [python, python, -m, ...]).
+exec "$VENV/bin/torchrun" --nproc_per_node=2 --master-port="${MASTER_PORT:-29519}" \
+  -m verl.trainer.sft_trainer \
   data.train_files="$DATA_DIR/train.parquet" \
   data.val_files="$DATA_DIR/test.parquet" \
   data.messages_key=messages \
