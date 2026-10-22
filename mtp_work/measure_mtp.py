@@ -1,22 +1,29 @@
-"""Measure MTP acceptance for Swift-27B on 2 Intel Arc XPU cards.
+"""Measure MTP acceptance for Swift-27B on the free Intel Arc XPU cards (2,3).
 
 Acceptance = fraction of positions i where the MTP head's argmax prediction of
 token i+2 (from main post-norm hidden state h_i + embedding of token i+1) equals
 the true token i+2.
 
-Run with:  ZE_AFFINITY_MASK=2,3  (cards 2,3 = our playground; 0,1 serve the agent)
+Corpus: a single text file (chunked to SEQ_LEN) OR a JSONL of {"domain","text"}
+lines (each line = one sequence, padded to SEQ_LEN; acceptance reported per domain
++ overall). The JSONL mode is what lets us benchmark across json / tool_call /
+python / prose.
+
+Run with:  ZE_AFFINITY_MASK=2,3  (cards 2,3 = playground; 0,1 = the serving model)
+Set MTP_HEAD=<path> to measure a finetuned head; unset = original mtp.* weights.
 """
-import os, sys, time, torch
+import os, sys, time, json, torch
+from collections import Counter, defaultdict
 sys.path.insert(0, "/home/haxor/AI/verl/mtp_work")
 from mtp_head import MTPHead
 from transformers import AutoConfig, AutoTokenizer
 from safetensors import safe_open
 
 MODEL = "/home/haxor/models/swift-27b"
-CORPUS = "/tmp/mtp-corpus/corpus.txt"
+CORPUS = os.environ.get("MTP_CORPUS", "/tmp/mtp-corpus/diverse_eval.jsonl")
 SEQ_LEN = 128
 BATCH = int(os.environ.get("MTP_BATCH", "4"))
-N_SEQS = int(os.environ.get("MTP_NSEQS", "256"))
+N_SEQS = int(os.environ.get("MTP_NSEQS", "0"))  # 0 = all
 
 def host_ram_free_gb():
     import subprocess
@@ -27,7 +34,6 @@ def host_ram_free_gb():
 def main():
     dev0 = "xpu:0"
     # PRE-FLIGHT GUARD: never risk the serving lane's (cards 0,1) host RAM.
-    # Host RAM + the XPU driver are system-wide shared; a big in-RAM build OOMs the host.
     avail = host_ram_free_gb()
     print(f"host RAM available: {avail}GB (safe threshold 30GB)", flush=True)
     if avail < 30:
@@ -36,7 +42,6 @@ def main():
     print(f"torch {torch.__version__} | xpu devs visible: {torch.xpu.device_count()}", flush=True)
 
     # ---- load main model: MEMORY-BOUNDED (meta init + tensor-by-tensor to XPU) ----
-    # Peak host RAM ~25GB (not 54GB) -> safe for the serving lane. No CPU/disk offload -> no meta tensors.
     from accelerate import init_empty_weights, load_checkpoint_in_model, infer_auto_device_map, dispatch_model
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
@@ -47,31 +52,26 @@ def main():
         model = Qwen3_5ForConditionalGeneration(cfg_full)
     device_map = infer_auto_device_map(
         model, max_memory={0: "31GiB", 1: "31GiB"},
-        no_split_module_classes=["Qwen3_5DecoderLayer"],  # keep each layer on one device
+        no_split_module_classes=["Qwen3_5DecoderLayer"],
     )
     load_checkpoint_in_model(model, MODEL, device_map=device_map, dtype=torch.bfloat16)
-    dispatch_model(model, device_map=device_map)  # install inter-device activation hooks
+    dispatch_model(model, device_map=device_map)
     model.eval()
-    print(f"loaded in {time.time()-t0:.0f}s | device_map: {dict(__import__('collections').Counter(str(v) for v in device_map.values()))}", flush=True)
+    print(f"loaded in {time.time()-t0:.0f}s", flush=True)
 
-    # ---- locate text model / norm / embed / lm_head ----
     text_model = model.model.language_model
     final_norm = text_model.norm
     embed = text_model.embed_tokens
     lm_head = model.lm_head
-    print("text_model:", type(text_model).__name__, "| layers:", len(text_model.layers))
+    cfg = model.config.text_config
 
     # ---- build MTP head; SHARE the device-mapped embed/lm_head (no copy) ----
-    cfg = model.config.text_config
     head = MTPHead(cfg, embed, lm_head, device=dev0).to(dev0)
-
-    # ---- load MTP head weights (finetuned checkpoint if MTP_HEAD set, else original) ----
     MTP_HEAD = os.environ.get("MTP_HEAD")
     if MTP_HEAD:
         sd = torch.load(MTP_HEAD, map_location="cpu")
         head.load_state_dict(sd)
-        rep = {"loaded": len(sd), "missing": [], "unexpected": []}
-        print(f"MTP head loaded from FINETUNED checkpoint: {MTP_HEAD} ({len(sd)} tensors)")
+        print(f"MTP head loaded from FINETUNED checkpoint: {MTP_HEAD} ({len(sd)} tensors)", flush=True)
     else:
         f = f"{MODEL}/model-00018-of-00018.safetensors"
         mtp_state = {}
@@ -80,45 +80,70 @@ def main():
                 if k.startswith("mtp."):
                     mtp_state[k] = s.get_tensor(k)
         rep = head.load_mtp_state(mtp_state)
-        print(f"MTP weights loaded (original): {rep['loaded']} | missing: {rep['missing']} | unexpected: {rep['unexpected']}")
-    head = head.to(torch.bfloat16)  # match the main model's dtype
+        print(f"MTP weights loaded (original): {rep['loaded']} | missing: {rep['missing']}", flush=True)
+    head = head.to(torch.bfloat16)
 
-    # ---- load + chunk corpus ----
+    # ---- load corpus: JSONL (per-domain) or single text (chunked) ----
     tok = AutoTokenizer.from_pretrained(MODEL)
-    text = open(CORPUS).read()
-    ids = tok(text, add_special_tokens=False)["input_ids"]
-    n_full = (len(ids) // SEQ_LEN) * SEQ_LEN
-    ids = ids[:n_full]
-    seqs = [torch.tensor(ids[i:i+SEQ_LEN]) for i in range(0, n_full, SEQ_LEN)]
-    seqs = seqs[:N_SEQS]
-    print(f"corpus: {len(ids)} tokens -> {len(seqs)} sequences of {SEQ_LEN}")
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else 0
+    seqs, domains = [], []
+    if CORPUS.endswith(".jsonl"):
+        for line in open(CORPUS):
+            o = json.loads(line)
+            ids = tok(o["text"], add_special_tokens=False)["input_ids"]
+            if len(ids) < 16:
+                continue
+            ids = ids[:SEQ_LEN]
+            seqs.append(torch.tensor(ids + [pad_id] * (SEQ_LEN - len(ids))))
+            domains.append((o["domain"], len(ids)))
+        print(f"jsonl corpus: {len(seqs)} seqs | domains: {dict(Counter(d for d,_ in domains))}", flush=True)
+    else:
+        text = open(CORPUS).read()
+        ids = tok(text, add_special_tokens=False)["input_ids"]
+        n_full = (len(ids) // SEQ_LEN) * SEQ_LEN
+        for i in range(0, n_full, SEQ_LEN):
+            seqs.append(torch.tensor(ids[i:i+SEQ_LEN])); domains.append(("text", SEQ_LEN))
+        print(f"text corpus: {len(ids)} tokens -> {len(seqs)} seqs of {SEQ_LEN}", flush=True)
+    if N_SEQS > 0:
+        seqs = seqs[:N_SEQS]; domains = domains[:N_SEQS]
 
-    # ---- measure ----
-    accepts = 0
-    total = 0
+    # ---- measure (padding-aware, per-domain) ----
+    accepts = defaultdict(int); totals = defaultdict(int)
     head.eval()
     with torch.no_grad():
         for b in range(0, len(seqs), BATCH):
             batch = torch.stack(seqs[b:b+BATCH]).to(dev0)
-            am = torch.ones_like(batch)
-            # call the TOP-LEVEL model so accelerate's device-mapping hooks handle
-            # the meta/CPU-offloaded layers; extract the text hidden states from its output
+            am = torch.zeros_like(batch)
+            for j in range(batch.size(0)):
+                am[j, :domains[b+j][1]] = 1
             out = model(input_ids=batch, attention_mask=am, output_hidden_states=True, use_cache=False)
-            h = final_norm(out.hidden_states[-1]).to(dev0)          # [B,L,H] post-norm
-            h_flat = h[:, :-2, :].reshape(-1, cfg.hidden_size)      # h_i, i in [0,L-3]
-            tok_flat = batch[:, 1:-1].reshape(-1)                  # token i+1
-            tgt_flat = batch[:, 2:].reshape(-1)                    # token i+2
-            logits = head(h_flat, tok_flat)                        # [N,V]
+            h = final_norm(out.hidden_states[-1]).to(dev0)
+            h_flat = h[:, :-2, :].reshape(-1, cfg.hidden_size)
+            tok_flat = batch[:, 1:-1].reshape(-1)
+            tgt_flat = batch[:, 2:].reshape(-1)
+            logits = head(h_flat, tok_flat)
             pred = logits.argmax(-1)
-            accepts += int((pred == tgt_flat).sum())
-            total += int(tgt_flat.numel())
+            match2d = (pred == tgt_flat).reshape(batch.size(0), -1)   # [B, L-2]
+            valid2d = (am[:, :-2] == 1) & (am[:, 2:] == 1)            # [B, L-2]
+            for j in range(batch.size(0)):
+                dom = domains[b+j][0]
+                accepts[dom] += int((match2d[j] & valid2d[j]).sum())
+                totals[dom] += int(valid2d[j].sum())
             if b % (BATCH*8) == 0:
-                print(f"  batch {b}/{len(seqs)} | running acceptance {accepts/total:.4f} ({total} positions)")
+                gt = sum(totals.values())
+                ga = sum(accepts.values())
+                print(f"  batch {b}/{len(seqs)} | running {ga/gt:.4f} ({gt} pos)", flush=True)
 
-    acc = accepts / total
-    print("\n" + "="*50)
-    print(f"MTP ACCEPTANCE (baseline): {acc:.4f}  ({accepts}/{total} positions)")
-    print("="*50)
+    tag = "finetuned" if MTP_HEAD else "baseline"
+    print("\n" + "="*54)
+    print(f"MTP ACCEPTANCE ({tag})  corpus={os.path.basename(CORPUS)}")
+    ga, gt = 0, 0
+    for dom in sorted(totals):
+        a, t = accepts[dom], totals[dom]
+        ga += a; gt += t
+        print(f"  {dom:12s} {a/t:.4f}   ({a}/{t})")
+    print(f"  {'OVERALL':12s} {ga/gt:.4f}   ({ga}/{gt})")
+    print("="*54)
 
 if __name__ == "__main__":
     main()
