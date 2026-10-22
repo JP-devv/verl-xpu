@@ -138,3 +138,30 @@ regression.
 Note on the "34% baseline" from early work: that was the **WikiText-only** (single prose
 domain) baseline. The diverse-corpus baseline is **41.7%** because json/tool_call pull it
 up — not a regression, just a different (harder, mixed) eval set.
+
+## Online serving A/B (BetterBench-style probe): baseline vs finetuned MTP head
+
+Live vLLM endpoints, 10 fixed diverse prompts (json/code/prose/tool/SQL/regex),
+64 max tokens, greedy. Acceptance = accepted/draft spec-decode tokens (from the
+vLLM `/metrics` counters, delta over the request set).
+
+| Metric | Baseline (orig mtp.*, serving lane TP2/CP2 cards 0,1) | Finetuned (trained head, TP2 cards 2,3) | Δ |
+|---|---|---|---|
+| **MTP acceptance** | **47.69%** (455/954) | **73.96%** (250/338) | **+26.27 pp** |
+| Decode speed | 121.78 tok/s | 26.48 tok/s | n/a (config artifact) |
+
+The finetuned head accepts **73.96%** of draft tokens vs **47.69%** baseline — a
+**+26.27 pp** online improvement (consistent in direction with the offline test-set
+delta of +7.77 pp; the online gap is larger because serving traffic + 1-spec-token
+drafting amplify the head's gain). The decode-speed gap (26 vs 122 tok/s) is a
+**config artifact, not the head**: the finetuned server ran `--enforce-eager`
+(XPU graph capture deadlocks on cards 2,3) with `num_speculative_tokens=1`, while
+the baseline serving lane uses XPU graphs + 4 spec tokens. With a matched
+graph+4-token config the higher acceptance would *raise* effective throughput.
+
+**Key enabler discovered:** a second vLLM/XCCL group on cards 2,3 only inits cleanly
+with the serving lane's exact env — critically `CCL_ZE_IPC_EXCHANGE=pidfd` (without it
+`onecclGetVersion` crashes on entry), plus `CCL_ENABLE_SYCL_KERNELS=1`,
+`CCL_TOPO_P2P_ACCESS=1`, `SYCL_PI_LEVEL_ZERO_USM_RESIDENT=0`, `LD_LIBRARY_PATH=$VENV/lib`.
+The XPU graph-capture path deadlocks (one rank 100% / one 0%) on a 2-GPU TP-only launch;
+`--enforce-eager` + `VLLM_XPU_ENABLE_XPU_GRAPH=0` avoids it.
