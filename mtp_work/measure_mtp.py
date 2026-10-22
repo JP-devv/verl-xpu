@@ -6,11 +6,13 @@ the true token i+2.
 
 Corpus: a single text file (chunked to SEQ_LEN) OR a JSONL of {"domain","text"}
 lines (each line = one sequence, padded to SEQ_LEN; acceptance reported per domain
-+ overall). The JSONL mode is what lets us benchmark across json / tool_call /
-python / prose.
++ overall). The JSONL mode benchmarks across json / tool_call / python / prose.
+
+Loads the main model ONCE and measures the ORIGINAL mtp.* head (baseline) and, if
+MTP_HEAD is set, the FINETUNED head too — reporting the delta. This is the fair
+comparison: both heads see the identical fixed eval sequences.
 
 Run with:  ZE_AFFINITY_MASK=2,3  (cards 2,3 = playground; 0,1 = the serving model)
-Set MTP_HEAD=<path> to measure a finetuned head; unset = original mtp.* weights.
 """
 import os, sys, time, json, torch
 from collections import Counter, defaultdict
@@ -29,11 +31,10 @@ def host_ram_free_gb():
     import subprocess
     out = subprocess.check_output(["free", "-g"]).decode()
     line = [l for l in out.splitlines() if l.startswith("Mem")][0]
-    return int(line.split()[6])  # 'available' column
+    return int(line.split()[6])
 
 def main():
     dev0 = "xpu:0"
-    # PRE-FLIGHT GUARD: never risk the serving lane's (cards 0,1) host RAM.
     avail = host_ram_free_gb()
     print(f"host RAM available: {avail}GB (safe threshold 30GB)", flush=True)
     if avail < 30:
@@ -41,7 +42,6 @@ def main():
         return
     print(f"torch {torch.__version__} | xpu devs visible: {torch.xpu.device_count()}", flush=True)
 
-    # ---- load main model: MEMORY-BOUNDED (meta init + tensor-by-tensor to XPU) ----
     from accelerate import init_empty_weights, load_checkpoint_in_model, infer_auto_device_map, dispatch_model
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
@@ -64,24 +64,7 @@ def main():
     embed = text_model.embed_tokens
     lm_head = model.lm_head
     cfg = model.config.text_config
-
-    # ---- build MTP head; SHARE the device-mapped embed/lm_head (no copy) ----
     head = MTPHead(cfg, embed, lm_head, device=dev0).to(dev0)
-    MTP_HEAD = os.environ.get("MTP_HEAD")
-    if MTP_HEAD:
-        sd = torch.load(MTP_HEAD, map_location="cpu")
-        head.load_state_dict(sd)
-        print(f"MTP head loaded from FINETUNED checkpoint: {MTP_HEAD} ({len(sd)} tensors)", flush=True)
-    else:
-        f = f"{MODEL}/model-00018-of-00018.safetensors"
-        mtp_state = {}
-        with safe_open(f, "pt") as s:
-            for k in s.keys():
-                if k.startswith("mtp."):
-                    mtp_state[k] = s.get_tensor(k)
-        rep = head.load_mtp_state(mtp_state)
-        print(f"MTP weights loaded (original): {rep['loaded']} | missing: {rep['missing']}", flush=True)
-    head = head.to(torch.bfloat16)
 
     # ---- load corpus: JSONL (per-domain) or single text (chunked) ----
     tok = AutoTokenizer.from_pretrained(MODEL)
@@ -107,43 +90,56 @@ def main():
     if N_SEQS > 0:
         seqs = seqs[:N_SEQS]; domains = domains[:N_SEQS]
 
-    # ---- measure (padding-aware, per-domain) ----
-    accepts = defaultdict(int); totals = defaultdict(int)
-    head.eval()
-    with torch.no_grad():
-        for b in range(0, len(seqs), BATCH):
-            batch = torch.stack(seqs[b:b+BATCH]).to(dev0)
-            am = torch.zeros_like(batch)
-            for j in range(batch.size(0)):
-                am[j, :domains[b+j][1]] = 1
-            out = model(input_ids=batch, attention_mask=am, output_hidden_states=True, use_cache=False)
-            h = final_norm(out.hidden_states[-1]).to(dev0)
-            h_flat = h[:, :-2, :].reshape(-1, cfg.hidden_size)
-            tok_flat = batch[:, 1:-1].reshape(-1)
-            tgt_flat = batch[:, 2:].reshape(-1)
-            logits = head(h_flat, tok_flat)
-            pred = logits.argmax(-1)
-            match2d = (pred == tgt_flat).reshape(batch.size(0), -1)   # [B, L-2]
-            valid2d = (am[:, :-2] == 1) & (am[:, 2:] == 1)            # [B, L-2]
-            for j in range(batch.size(0)):
-                dom = domains[b+j][0]
-                accepts[dom] += int((match2d[j] & valid2d[j]).sum())
-                totals[dom] += int(valid2d[j].sum())
-            if b % (BATCH*8) == 0:
-                gt = sum(totals.values())
-                ga = sum(accepts.values())
-                print(f"  batch {b}/{len(seqs)} | running {ga/gt:.4f} ({gt} pos)", flush=True)
+    # ---- measurement over the (fixed) eval sequences ----
+    def measure(tag):
+        accepts = defaultdict(int); totals = defaultdict(int)
+        head.eval()
+        with torch.no_grad():
+            for b in range(0, len(seqs), BATCH):
+                batch = torch.stack(seqs[b:b+BATCH]).to(dev0)
+                am = torch.zeros_like(batch)
+                for j in range(batch.size(0)):
+                    am[j, :domains[b+j][1]] = 1
+                out = model(input_ids=batch, attention_mask=am, output_hidden_states=True, use_cache=False)
+                h = final_norm(out.hidden_states[-1]).to(dev0)
+                h_flat = h[:, :-2, :].reshape(-1, cfg.hidden_size)
+                tok_flat = batch[:, 1:-1].reshape(-1)
+                tgt_flat = batch[:, 2:].reshape(-1)
+                logits = head(h_flat, tok_flat)
+                pred = logits.argmax(-1)
+                match2d = (pred == tgt_flat).reshape(batch.size(0), -1)
+                valid2d = (am[:, :-2] == 1) & (am[:, 2:] == 1)
+                for j in range(batch.size(0)):
+                    dom = domains[b+j][0]
+                    accepts[dom] += int((match2d[j] & valid2d[j]).sum())
+                    totals[dom] += int(valid2d[j].sum())
+        print(f"\n=== {tag} ===")
+        ga, gt = 0, 0
+        for dom in sorted(totals):
+            a, t = accepts[dom], totals[dom]
+            ga += a; gt += t
+            print(f"  {dom:12s} {a/t:.4f}   ({a}/{t})")
+        print(f"  {'OVERALL':12s} {ga/gt:.4f}   ({ga}/{gt})")
+        return ga / gt
 
-    tag = "finetuned" if MTP_HEAD else "baseline"
-    print("\n" + "="*54)
-    print(f"MTP ACCEPTANCE ({tag})  corpus={os.path.basename(CORPUS)}")
-    ga, gt = 0, 0
-    for dom in sorted(totals):
-        a, t = accepts[dom], totals[dom]
-        ga += a; gt += t
-        print(f"  {dom:12s} {a/t:.4f}   ({a}/{t})")
-    print(f"  {'OVERALL':12s} {ga/gt:.4f}   ({ga}/{gt})")
-    print("="*54)
+    # baseline: original mtp.* weights
+    f = f"{MODEL}/model-00018-of-00018.safetensors"
+    mtp_state = {}
+    with safe_open(f, "pt") as s:
+        for k in s.keys():
+            if k.startswith("mtp."):
+                mtp_state[k] = s.get_tensor(k)
+    head.load_mtp_state(mtp_state)
+    head = head.to(torch.bfloat16)
+    base = measure("BASELINE (original mtp.*)")
+
+    # finetuned (if MTP_HEAD set)
+    MTP_HEAD = os.environ.get("MTP_HEAD")
+    if MTP_HEAD:
+        head.load_state_dict(torch.load(MTP_HEAD, map_location="cpu"))
+        head = head.to(torch.bfloat16)
+        ft = measure(f"FINETUNED ({os.path.basename(MTP_HEAD)})")
+        print(f"\n*** DELTA: {ft-base:+.4f}   ({base:.4f} -> {ft:.4f}) ***")
 
 if __name__ == "__main__":
     main()
