@@ -130,6 +130,25 @@ which is both faster and stable. Config gotcha hit: `data.train_batch_size` is t
 batch and must be ≥ the GPU count (with 2 GPUs, `=1` → per-GPU 0.5 → `batch_size=0` error;
 minimum is `=2`).
 
+**oneCCL 2022.0.0 upgrade — ATTEMPTED, INCOMPATIBLE with torch 2.9.1+xpu (reverted).**
+Tried to move off the 2021.16.1/`mpi` stack to oneCCL 2022.0.0 (native XCCL) to fix the
+FSDP-backward crash. oneCCL is a standalone Intel pip package, so a `--no-deps` install of
+2022.0.0 was possible **without** touching torch — but it failed: uninstalling 2021.16.1
+removed **`libsycl.so.9`**, which torch 2.9.1+xpu is linked against (the 2021.16.1 oneCCL
+bundles that `.so.9`; the venv's `intel-sycl-rt` 2025.2.1 only ships `libsycl.so.8`). Result:
+`ImportError: libsycl.so.9: cannot open shared object file`. **Root cause: oneCCL 2022.0.0
+and torch 2.9.1+xpu need different `libsycl.so.9` builds and cannot coexist.** Reverted to
+oneCCL 2021.16.1 (restores `libsycl.so.9`); torch imports and the 512 MiB large-allreduce
+probe pass again (~36 GB/s). **The clean path to native-XCCL oneCCL 2022.0.0+ is a matched
+set — torch 2.13.0+xpu + oneCCL 2022.0.0 + `intel-sycl-rt` 2026.x (the k8v4-pins stack) —
+which is a major, high-risk venv change** (would re-break the transformers 5.12.1 / verl
+0.10.0.dev / MTP-head pins and needs full re-validation). Not done here; the venv is left at
+the known-good 2021.16.1 + torch 2.9.1 state. **1/2/4-GPU scaling evidence: not obtainable
+on this venv** — the FSDP backward crashes on 2021.16.1/`mpi` (above), and the 2022.0.0
+native-XCCL that would fix it is incompatible with torch 2.9.1. The MTP-head trainer
+(`train_mtp3.py`) is the one path that works well on this venv (single-card head, no FSDP
+collectives) and is the practical guinea pig until the matched oneCCL/torch upgrade is made.
+
 ## Status
 
 - [x] Model staged (`~/models/swift-27b`), original intact
@@ -144,6 +163,10 @@ minimum is `=2`).
 - [ ] **Real verl FSDP SFT trainer**: preflight + FSDP wrap + loop-start work, but the
   first step **crashes** (old oneCCL 2021.16.1/mpi can't do the FSDP many-reduce-scatter
   backward) → `mpiexec` crash-respawn loop. **Fix: upgrade to oneCCL 2022.0.0+ native XCCL**
+- [ ] **oneCCL 2022.0.0 upgrade**: attempted `--no-deps`, **incompatible with torch 2.9.1+xpu**
+  (needs a different `libsycl.so.9`); reverted to 2021.16.1. Clean path = matched
+  torch 2.13.0+xpu + oneCCL 2022.0.0 + sycl-rt 2026.x (major, high-risk). Venv left at
+  known-good 2021.16.1 + torch 2.9.1.
 - [x] **XPU-optimized training path**: FSDP-sharded (device_map) all-on-XPU MTP
   trainer — 27B sharded across cards 2,3 (no card holds the full 54GB), MTP head on
   the last card sharing the main embed (no 2.4GB local copy → no OOM). **Verified
