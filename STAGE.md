@@ -111,6 +111,25 @@ unset. **Result: 512 MiB bf16 all-reduce in 0.03 s (~36 GB/s), correct sum — P
 `scripts/xpu/mpi-ar-wrapper.sh`). This unblocks real-model FSDP on cards 2,3. A host with
 RDMA (or a newer oneCCL with a software provider) would be cleaner, but this is enough.
 
+**Real verl FSDP SFT trainer — BLOCKED (crash-respawn loop).** Ran
+`scripts/xpu/smoke-sft-2gpu.sh` (Qwen2.5-0.5B, 2 GPUs, `VERL_PLATFORM=intel`) on cards 2,3.
+The **preflight passes** (2 devices, `xpu/intel/xccl`), the **FSDP wrap works** (model
+loaded, 5.3 GB, `min_num_params=1e8` → one FSDP unit, `forward_prefetch=true`,
+`use_torch_compile=false`, `enable_gradient_checkpointing=false`), and the **training loop
+starts** (`Epoch 1/1: 0/N`). But the **first training step never completes**: the ranks
+run at ~100% CPU for ~50 s then die (native crash in the oneCCL/SYCL layer, no Python
+traceback), and `mpiexec` respawns them in a loop (seen as fresh PIDs with `etimes` reset
+to ~50 s while wall-clock keeps climbing). Root cause: the venv's **old oneCCL 2021.16.1
++ `mpi` transport** handles a single large all-reduce (the probe passed) but **crashes on
+the FSDP backward's many-small reduce-scatters** (~one per weight tensor). The
+`CCL_SYCL_COPY_ENGINE=1` knob fixes the large-allreduce path, not this one. **The real fix
+for the primary goal (fast, scalable XPU training) is to move off the 2021.16.1/mpi stack
+to oneCCL 2022.0.0+ with native XCCL** (the k8v4-pins known-good set: no `mpi` transport,
+`CCL_SYCL_ALLREDUCE_LL=ring` + copy-engine + the three `*_SIMPLE_THRESHOLD` + `ALLTOALL_TMP_BUF`),
+which is both faster and stable. Config gotcha hit: `data.train_batch_size` is the **global**
+batch and must be ≥ the GPU count (with 2 GPUs, `=1` → per-GPU 0.5 → `batch_size=0` error;
+minimum is `=2`).
+
 ## Status
 
 - [x] Model staged (`~/models/swift-27b`), original intact
@@ -122,6 +141,9 @@ RDMA (or a newer oneCCL with a software provider) would be cleaner, but this is 
 - [x] XPU smoke test: xccl collectives + FSDP engine + device pinning verified on 2,3
 - [x] **Large all-reduce UNBLOCKED**: `CCL_ATL_TRANSPORT=mpi`+`I_MPI_FABRICS=shm`+
   `CCL_SYCL_COPY_ENGINE=1`+B70 block via `mpiexec` → 512 MiB in 0.03 s (~36 GB/s), PASS
+- [ ] **Real verl FSDP SFT trainer**: preflight + FSDP wrap + loop-start work, but the
+  first step **crashes** (old oneCCL 2021.16.1/mpi can't do the FSDP many-reduce-scatter
+  backward) → `mpiexec` crash-respawn loop. **Fix: upgrade to oneCCL 2022.0.0+ native XCCL**
 - [x] **XPU-optimized training path**: FSDP-sharded (device_map) all-on-XPU MTP
   trainer — 27B sharded across cards 2,3 (no card holds the full 54GB), MTP head on
   the last card sharing the main embed (no 2.4GB local copy → no OOM). **Verified

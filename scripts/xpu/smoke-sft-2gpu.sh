@@ -29,6 +29,16 @@ export VERL_PLATFORM=intel              # force the intel/xpu/xccl platform
 export CCL_ATL_TRANSPORT="${CCL_ATL_TRANSPORT:-mpi}"
 export ONEAPI_ROOT="${ONEAPI_ROOT:-$VENV}"
 export I_MPI_FABRICS="${I_MPI_FABRICS:-shm}"
+# B70 SYCL device-backend block: route large all-reduces over the DMA copy-engine
+# (not the deadlocking compute path). Validated by scripts/xpu/test_large_allreduce.py
+# (512MiB in 0.03s @ ~36GB/s). Needed once grad-sync tensors grow (real models).
+export CCL_SYCL_COPY_ENGINE="${CCL_SYCL_COPY_ENGINE:-1}"
+export CCL_SYCL_ALLREDUCE_LL="${CCL_SYCL_ALLREDUCE_LL:-ring}"
+export CCL_SYCL_ALLREDUCE_SIMPLE_READ="${CCL_SYCL_ALLREDUCE_SIMPLE_READ:-1}"
+export CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD="${CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD:-4294967296}"
+export CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD="${CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD:-4294967296}"
+export CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD="${CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD:-4294967296}"
+export CCL_SYCL_ALLTOALL_TMP_BUF="${CCL_SYCL_ALLTOALL_TMP_BUF:-1}"
 
 MODEL_PATH="${MODEL_PATH:-/tmp/xpu-sanity/qwen2.5-0.5b}"
 DATA_DIR="${DATA_DIR:-/tmp/verl-xpu-smoke}"
@@ -56,12 +66,14 @@ exec "$VENV/bin/mpiexec" -n 2 \
   data.train_files="$DATA_DIR/train.parquet" \
   data.val_files="$DATA_DIR/test.parquet" \
   data.messages_key=messages \
-  data.micro_batch_size_per_gpu=4 \
-  data.train_batch_size=8 \
-  data.max_length=512 \
+  data.micro_batch_size_per_gpu=1 \
+  data.train_batch_size=2 \
+  data.max_length=128 \
+  data.use_dynamic_bsz=false \
   optim.lr=1e-4 \
   engine=fsdp \
   engine.use_torch_compile=false \
+  engine.forward_prefetch=true \
   model.enable_gradient_checkpointing=false \
   engine.wrap_policy.min_num_params=100000000 \
   model.path="$MODEL_PATH" \
