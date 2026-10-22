@@ -130,6 +130,32 @@ which is both faster and stable. Config gotcha hit: `data.train_batch_size` is t
 batch and must be ≥ the GPU count (with 2 GPUs, `=1` → per-GPU 0.5 → `batch_size=0` error;
 minimum is `=2`).
 
+**Real verl FSDP SFT trainer — UNBLOCKED on the throwaway 2026 venv (native XCCL 2022.0.0).**
+Built a **separate throwaway venv** `~/AI/verl/.venv-xpu2026` with the matched set
+**torch 2.13.0+xpu + oneCCL 2022.0.0 + `intel-sycl-rt` 2026.0.0** (the k8v4-pins known-good
+stack) — the main `~/AI/verl/.venv` (torch 2.9.1 + oneCCL 2021.16.1) is **untouched**. On this
+venv the FSDP SFT smoke test **completes**: Qwen2.5-0.5B, 2 GPUs (cards 2,3), `torchrun`
+(native XCCL needs **no** `mpi` transport / `mpiexec`), all **16/16 steps** run, loss decreases
+(0.90 → 0.32), grad_norms finite, and the **FSDP model checkpoint saves** (599 MB, 2 rank
+files). **The 2021.16.1/`mpi` FSDP-backward many-reduce-scatter crash is fixed** by the native
+XCCL 2022.0.0 backend. Setup gotchas that cost time: (a) the `--no-deps` pure-Python dep install
+must **exclude the entire Intel/SYCL/MKL/oneCCL/nvidia stack** (a filter pattern missing `.*`
+before `==` let 2025.2.1 `onemkl-sycl-blas` in, which ships `libmkl_sycl_blas.so.5` and breaks
+torch 2.13.0's `.so.6` link); (b) `torchrun` must be called as `torchrun … -m verl.trainer.sft_trainer`
+— passing `"$PY"` as the first arg makes the worker command `[python, python, -m, …]` (null-byte
+SyntaxError); (c) pip/TMPDIR must **not** be the 31 G `/tmp` tmpfs (the 819 MB torch wheel unpack
+hits EDQUOT) — point `TMPDIR` at `/var/tmp`.
+
+**1/2/4-GPU scaling evidence (Qwen2.5-0.5B, 128-token micro-batch, 32 total samples):**
+- **1 GPU** (card 2): 32 steps @ **5.95 it/s** → 32 samples in ~5.4 s; peak XPU mem 11.7 GB.
+- **2 GPUs** (cards 2,3): 16 steps @ **~4.0 it/s** → 32 samples in ~4.0 s; peak XPU mem 6.7 GB/rank.
+- **4 GPUs: not runnable on this box** — cards 0,1 are the live serving lane (never touched), so
+  the max is 2. Wall-clock speedup 1-GPU→2-GPU is **1.35×** (5.4 s → 4.0 s for the same 32 samples);
+  it is sub-linear because a 0.5 B model's per-step compute is tiny, so the FSDP reduce-scatter/
+  all-gather collectives dominate. A 27 B model (the real guinea pig) has far more per-step compute
+  per GPU, so the collective fraction shrinks and the 2-GPU speedup should approach the ideal.
+  Memory scales down as expected (11.7 GB → 6.7 GB/rank) — FSDP sharding is working.
+
 **oneCCL 2022.0.0 upgrade — ATTEMPTED, INCOMPATIBLE with torch 2.9.1+xpu (reverted).**
 Tried to move off the 2021.16.1/`mpi` stack to oneCCL 2022.0.0 (native XCCL) to fix the
 FSDP-backward crash. oneCCL is a standalone Intel pip package, so a `--no-deps` install of
@@ -142,12 +168,13 @@ oneCCL 2021.16.1 (restores `libsycl.so.9`); torch imports and the 512 MiB large-
 probe pass again (~36 GB/s). **The clean path to native-XCCL oneCCL 2022.0.0+ is a matched
 set — torch 2.13.0+xpu + oneCCL 2022.0.0 + `intel-sycl-rt` 2026.x (the k8v4-pins stack) —
 which is a major, high-risk venv change** (would re-break the transformers 5.12.1 / verl
-0.10.0.dev / MTP-head pins and needs full re-validation). Not done here; the venv is left at
-the known-good 2021.16.1 + torch 2.9.1 state. **1/2/4-GPU scaling evidence: not obtainable
-on this venv** — the FSDP backward crashes on 2021.16.1/`mpi` (above), and the 2022.0.0
-native-XCCL that would fix it is incompatible with torch 2.9.1. The MTP-head trainer
-(`train_mtp3.py`) is the one path that works well on this venv (single-card head, no FSDP
-collectives) and is the practical guinea pig until the matched oneCCL/torch upgrade is made.
+0.10.0.dev / MTP-head pins and needs full re-validation). **DONE in a throwaway venv**
+(`~/AI/verl/.venv-xpu2026`, see above) — the main `~/AI/verl/.venv` is left at the
+known-good 2021.16.1 + torch 2.9.1 state, and the throwaway venv is where the FSDP SFT
+path now works. **1/2-GPU scaling evidence captured** (above); 4-GPU not runnable on this
+box (cards 0,1 = serving lane). The MTP-head trainer (`train_mtp3.py`) still runs on the
+main venv (single-card head, no FSDP collectives); the full 27B FSDP path now runs on the
+throwaway 2026 venv.
 
 ## Status
 
@@ -160,13 +187,13 @@ collectives) and is the practical guinea pig until the matched oneCCL/torch upgr
 - [x] XPU smoke test: xccl collectives + FSDP engine + device pinning verified on 2,3
 - [x] **Large all-reduce UNBLOCKED**: `CCL_ATL_TRANSPORT=mpi`+`I_MPI_FABRICS=shm`+
   `CCL_SYCL_COPY_ENGINE=1`+B70 block via `mpiexec` → 512 MiB in 0.03 s (~36 GB/s), PASS
-- [ ] **Real verl FSDP SFT trainer**: preflight + FSDP wrap + loop-start work, but the
-  first step **crashes** (old oneCCL 2021.16.1/mpi can't do the FSDP many-reduce-scatter
-  backward) → `mpiexec` crash-respawn loop. **Fix: upgrade to oneCCL 2022.0.0+ native XCCL**
-- [ ] **oneCCL 2022.0.0 upgrade**: attempted `--no-deps`, **incompatible with torch 2.9.1+xpu**
-  (needs a different `libsycl.so.9`); reverted to 2021.16.1. Clean path = matched
-  torch 2.13.0+xpu + oneCCL 2022.0.0 + sycl-rt 2026.x (major, high-risk). Venv left at
-  known-good 2021.16.1 + torch 2.9.1.
+- [x] **Real verl FSDP SFT trainer — UNBLOCKED** on the throwaway 2026 venv (native XCCL
+  2022.0.0): 16/16 steps, loss 0.90→0.32, FSDP checkpoint saved. The 2021.16.1/`mpi`
+  many-reduce-scatter backward crash is fixed.
+- [x] **oneCCL 2022.0.0 upgrade — DONE in throwaway venv** `~/AI/verl/.venv-xpu2026`
+  (torch 2.13.0+xpu + oneCCL 2022.0.0 + sycl-rt 2026.0.0). Main venv untouched.
+  **1/2-GPU scaling evidence captured** (1.35× wall-clock; 4-GPU not runnable — cards 0,1
+  are the serving lane).
 - [x] **XPU-optimized training path**: FSDP-sharded (device_map) all-on-XPU MTP
   trainer — 27B sharded across cards 2,3 (no card holds the full 54GB), MTP head on
   the last card sharing the main embed (no 2.4GB local copy → no OOM). **Verified
