@@ -112,3 +112,29 @@ oneCCL 2021.16.1). 998 train / 254 val seqs, CE + margin loss.
 
 **+8.3 pp** over 5 epochs. Peak XPU mem card 2: 32566/32656 MiB (99.7%). 1 GPU infeasible
 (27B bf16 ≈ 54 GB > 32 GB/card); 2 GPU minimum; 4 GPU blocked by serving lane.
+
+## Apples-to-apples: two-phase vs all-on-XPU MTP head (disjoint test set)
+
+`measure_mtp.py` on `/tmp/mtp-corpus/diverse_test.jsonl` (256 seqs, 24,856 positions;
+64 each of json/tool_call/python/prose). Baseline = original `mtp.*` head (identical for
+both rows). Finetuned = the saved `mtp_head_final.pt` from each trainer.
+
+| Domain (test) | Baseline | Two-phase `train_mtp2` | All-on-XPU `train_mtp3` | Δ (2-phase) | Δ (all-on-XPU) |
+|---|---|---|---|---|---|
+| json | 0.4134 | 0.5852 | **0.6018** | +0.1718 | **+0.1884** |
+| tool_call | 0.5726 | 0.8393 | **0.8419** | +0.2666 | **+0.2693** |
+| python | 0.4215 | 0.3956 | 0.3909 | −0.0259 | −0.0306 |
+| prose | 0.3431 | 0.3451 | 0.3373 | +0.0020 | −0.0058 |
+| **OVERALL** | **0.4171** | **0.4931** | **0.4948** | **+0.0760** | **+0.0777** |
+
+**Conclusion:** the all-on-XPU trainer (frozen 27B sharded on cards 2,3, MTP head on the
+last card, no CPU h_i round-trip) is **quality-equivalent** to the two-phase CPU-h_i
+trainer (deltas within ±0.01–0.02 = noise on 24.8k positions). Both show the same
+signature: large gains on structured domains (json +18–19pp, tool_call +27pp), flat-to-
+slightly-negative on prose/python. The all-on-XPU path is the one that runs inside verl's
+FSDP-style engine, so this validates it as the production training path with no quality
+regression.
+
+Note on the "34% baseline" from early work: that was the **WikiText-only** (single prose
+domain) baseline. The diverse-corpus baseline is **41.7%** because json/tool_call pull it
+up — not a regression, just a different (harder, mixed) eval set.
