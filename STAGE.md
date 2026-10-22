@@ -282,3 +282,12 @@ throwaway 2026 venv.
    corpus (Nemotron text) + stronger regularization, re-measured on the disjoint test set.
 4. Wire a `sft_trainer`/`ppo_trainer` config for `device=xpu`, 2 GPUs, once the
    transport + all-on-XPU path are in.
+
+**BetterBench decode-only A/B (matched config) — recorded.** Real BetterBench 0.6.1
+(`--quick --no-prefill --no-concurrency`, corpus v1.0, 8 cats, 5 passes/cat) on both
+endpoints. **MTP acceptance: baseline 56.76% → finetuned 73.67% (+16.91 pp)** — the
+fair head-quality signal (same backbone, same corpus, same BB config; only head weights
+differ). Decode t/s (157.9 vs 28.8) is a server-config artifact (baseline XPU graphs +
+4 spec tok vs finetuned `--enforce-eager` + 1 spec tok, because the graph path deadlocks
+on a 2-GPU TP launch on cards 2,3) — a floor, not the head's true speed. Full per-category
+tables + result-file paths in `mtp_work/MTP_FT.md` §"BetterBench decode-only A/B".

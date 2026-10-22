@@ -165,3 +165,53 @@ with the serving lane's exact env — critically `CCL_ZE_IPC_EXCHANGE=pidfd` (wi
 `CCL_TOPO_P2P_ACCESS=1`, `SYCL_PI_LEVEL_ZERO_USM_RESIDENT=0`, `LD_LIBRARY_PATH=$VENV/lib`.
 The XPU graph-capture path deadlocks (one rank 100% / one 0%) on a 2-GPU TP-only launch;
 `--enforce-eager` + `VLLM_XPU_ENABLE_XPU_GRAPH=0` avoids it.
+
+## BetterBench decode-only A/B (matched config) — baseline vs finetuned MTP head
+
+Real BetterBench 0.6.1 (`python3 -m betterbench.cli run --quick --no-prefill
+--no-concurrency`, corpus v1.0, 8 categories, 1 warmup + 5 passes/cat, temp 0.7,
+cold prefix-cache). Both endpoints matched on the BetterBench config. The vLLM
+server configs differ (noted per row) because the finetuned server runs on the
+free cards 2,3 where the XPU graph-capture path deadlocks, so it uses
+`--enforce-eager` + 1 spec token; the baseline serving lane uses XPU graphs + 4
+spec tokens on cards 0,1.
+
+**Headline — MTP acceptance (vLLM `/metrics` accepted/draft):**
+
+| | Baseline (orig `mtp.*`) | Finetuned (trained head) | Δ |
+|---|---|---|---|
+| **MTP acceptance** | **56.76%** (939204/1654656) | **73.67%** (1542/2093) | **+16.91 pp** |
+
+**BetterBench single-stream decode (batch=1):**
+
+| category | baseline decode t/s (med) | finetuned decode t/s (med) | baseline tok/update | finetuned tok/update |
+|---|--:|--:|--:|--:|
+| chat | 116.3 | 26.5 | 3.06 | 1.61 |
+| code | 156.0 | 27.6 | 4.07 | 1.65 |
+| file_edit | 197.0 | 31.8 | 5.30 | 1.90 |
+| json | 180.7 | 29.2 | 4.87 | 1.79 |
+| math | 180.3 | 28.2 | 4.86 | 1.79 |
+| prose | 93.9 | 25.9 | 2.51 | 1.54 |
+| reasoning | 171.5 | 29.9 | 3.35 | 1.79 |
+| summarization | 159.1 | 31.2 | 4.29 | 1.84 |
+| **combined (weighted)** | **157.9** | **28.8** | — | — |
+
+Also: baseline update p99 28.0 ms / TTFT p50 108 ms; finetuned update p99 74.0 ms /
+TTFT p50 128 ms.
+
+**Reading the two numbers separately (they measure different things):**
+- **MTP acceptance (+16.91 pp) is the head-quality signal** and it is a fair A/B:
+  both servers run the same 27B backbone, same corpus, same BetterBench config; only
+  the MTP head weights differ. The finetuned head accepts 73.67% of draft tokens vs
+  56.76% baseline — it predicts the next token far more often.
+- **Decode t/s (157.9 vs 28.8) is NOT a head-quality comparison** — it is dominated
+  by the server-config gap: baseline = XPU graphs + 4 spec tokens (tok/update up to
+  5.3), finetuned = `--enforce-eager` + 1 spec token (tok/update ~1.6-1.9). The
+  enforce-eager path alone costs ~5-8× on this stack, and 1-vs-4 spec tokens caps the
+  tokens-per-update. A matched graph+4-token finetuned server would close most of that
+  gap *and* benefit from the higher acceptance. (The graph path deadlocks on a 2-GPU
+  TP-only launch on cards 2,3 — the same failure that blocks the FSDP run — so the
+  finetuned number here is a floor, not the head's true serving speed.)
+
+Result files: `/tmp/bb-baseline.json` (165 KB), `/tmp/bb-finftuned.json` (98 KB);
+HTML reports `/tmp/bb-baseline.html`, `/tmp/bb-finftuned.html`.
