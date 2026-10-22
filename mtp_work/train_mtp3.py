@@ -4,12 +4,18 @@ The two-phase approach (train_mtp2.py) is CPU-bound in phase 2: it harvests h_i 
 CPU, then shuttles them back to the XPU every step, and a 424M head can't saturate a
 B70. This version keeps EVERYTHING on the cards:
 
-  - The frozen 27B main model stays loaded across the two free cards (device_map,
-    NO CPU offload -> no meta tensors).
-  - The MTP head lives on the LAST card (where final_norm + lm_head live), with a
-    local copy of embed_tokens on that same card.
+  - The frozen 27B main model is SHARDED across the two free cards (device_map,
+    NO CPU offload) so no card holds the full 54GB model — the FSDP-equivalent for a
+    frozen (no-backward) model.
+  - The MTP head lives on the LAST card (where final_norm + lm_head live) and shares
+    the main model's embed_tokens (xpu:0) — NO local embed copy (a full-vocab copy
+    costs ~2.4GB and was the OOM). The head moves only the small [N,H] token-embedding
+    tensor to its card on the fly.
   - Each step: run the main model forward (no grad) to get h_i ON the last card,
     run the MTP head (with grad) on that same card, backprop through the head only.
+
+Per-step logging (loss + a cheap batch-level argmax-acceptance proxy every
+MTP_LOG_EVERY steps) plus a full val-acceptance each epoch.
 
 No CPU<->XPU round-trip for h_i; both cards do real work (main-model forward spans
 both, MTP head fwd/bwd on the last). This is the same shape verl's FSDP engine uses.
@@ -37,6 +43,7 @@ LR      = float(os.environ.get("MTP_LR", "1e-4"))
 MARGIN  = float(os.environ.get("MTP_MARGIN", "1.0"))
 LAMBDA  = float(os.environ.get("MTP_LAMBDA", "0.5"))
 PATIENCE = int(os.environ.get("MTP_PATIENCE", "3"))
+LOG_EVERY = int(os.environ.get("MTP_LOG_EVERY", "50"))  # per-step log cadence
 random.seed(0)
 
 def host_ram_free_gb():
@@ -67,8 +74,8 @@ def main():
     tok = AutoTokenizer.from_pretrained(MODEL)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else 0
 
-    # ---- load the frozen 27B across the two free cards (no CPU offload) ----
-    print("=== loading frozen 27B on cards 2,3 (device_map, no offload) ===", flush=True)
+    # ---- load the frozen 27B SHARDED across the two free cards (no CPU offload) ----
+    print("=== loading frozen 27B sharded on cards 2,3 (device_map, no offload) ===", flush=True)
     t0 = time.time()
     with init_empty_weights():
         model = Qwen3_5ForConditionalGeneration(cfg_full)
@@ -84,22 +91,18 @@ def main():
     text_model = model.model.language_model
     final_norm = text_model.norm
     lm_head = model.lm_head
+    main_embed = text_model.embed_tokens  # on xpu:0 (part of the 27B shard)
     # the last card = where final_norm + lm_head live (visible index 1 = physical 3)
     last_dev = next(final_norm.parameters()).device
-    print(f"final_norm/lm_head on {last_dev}; MTP head will live there", flush=True)
+    print(f"final_norm/lm_head on {last_dev}; MTP head will live there",
+          f"(embed shared from {next(main_embed.parameters()).device} — NO local copy)", flush=True)
 
-    # ---- local copy of embed_tokens on the last card (main's embed is on card 0) ----
-    idx = json.load(open(os.path.join(MODEL, "model.safetensors.index.json")))["weight_map"]
-    with safe_open(os.path.join(MODEL, idx["model.language_model.embed_tokens.weight"]), "pt") as s:
-        embed_w = s.get_tensor("model.language_model.embed_tokens.weight").to(torch.bfloat16).to(last_dev)
-    embed_copy = nn.Embedding(cfg.vocab_size, H)
-    embed_copy.weight = nn.Parameter(embed_w)
-    embed_copy.to(last_dev)
-    for p in embed_copy.parameters():
-        p.requires_grad_(False)
+    # NO local embed copy: a full-vocab copy costs ~2.4GB on the already-full last
+    # card (that was the OOM). The MTPHead takes the main model's embed (xpu:0) and
+    # moves only the small [N,H] token-embedding tensor to the head's card on the fly.
 
-    # ---- build the MTP head on the last card (shares lm_head, local embed) ----
-    head = MTPHead(cfg, embed_copy, lm_head, device=str(last_dev)).to(last_dev)
+    # ---- build the MTP head on the last card (shares lm_head + main embed) ----
+    head = MTPHead(cfg, main_embed, lm_head, device=str(last_dev)).to(last_dev)
     f = f"{MODEL}/model-00018-of-00018.safetensors"
     mtp_state = {}
     with safe_open(f, "pt") as s:
@@ -116,6 +119,9 @@ def main():
     # ---- data ----
     train_seqs, _ = load_jsonl_seqs(TRAIN, tok, pad_id)
     val_seqs, val_dom = load_jsonl_seqs(VAL, tok, pad_id)
+    n_train_batches = (len(train_seqs) + BATCH - 1) // BATCH
+    print(f"train: {len(train_seqs)} seqs ({n_train_batches} batches/epoch) | "
+          f"val: {len(val_seqs)} seqs | log every {LOG_EVERY} steps", flush=True)
 
     def acceptance(seqs, doms):
         head.eval()
@@ -168,10 +174,19 @@ def main():
             loss = ce + LAMBDA * margin_loss
             optimizer.zero_grad(); loss.backward(); optimizer.step()
             step += 1
+            # ---- per-step logging: loss + cheap batch-level argmax-acceptance proxy ----
+            if step % LOG_EVERY == 0:
+                with torch.no_grad():
+                    pred = logits.argmax(-1)
+                    batch_acc = float((pred == tgt_flat).float().mean())
+                print(f"  [ep{epoch}] step {step:5d}/{n_train_batches*EPOCHS} | "
+                      f"loss {loss.item():.4f} (ce {ce.item():.4f} + margin {margin_loss.item():.4f}) | "
+                      f"batch-acc {batch_acc:.4f}", flush=True)
         val_acc = acceptance(val_seqs, val_dom)
         ep_s = time.time() - t_start
         t_start = time.time()
-        print(f"epoch {epoch:2d} | loss {loss.item():.4f} | val acc {val_acc:.4f} (best {best_val:.4f})", flush=True)
+        print(f"epoch {epoch:2d} | {ep_s:.0f}s | final loss {loss.item():.4f} | "
+              f"val acc {val_acc:.4f} (best {best_val:.4f})", flush=True)
         if val_acc > best_val + 1e-4:
             best_val = val_acc
             best_state = {k: v.detach().cpu() for k, v in head.state_dict().items()}
@@ -184,7 +199,8 @@ def main():
 
     torch.save(best_state, f"{OUT}/mtp_head_final.pt")
     with open(f"{OUT}/best_val_acc.txt", "w") as f: f.write(f"{best_val:.6f}\n")
-    print(f"DONE | best val acc {best_val:.4f} (baseline {base_val:.4f}) | all-on-XPU, no CPU h_i round-trip", flush=True)
+    print(f"DONE | best val acc {best_val:.4f} (baseline {base_val:.4f}) | "
+          f"all-on-XPU, 27B sharded, no CPU h_i round-trip", flush=True)
     return 0
 
 if __name__ == "__main__":

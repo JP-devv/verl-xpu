@@ -122,8 +122,11 @@ RDMA (or a newer oneCCL with a software provider) would be cleaner, but this is 
 - [x] XPU smoke test: xccl collectives + FSDP engine + device pinning verified on 2,3
 - [x] **Large all-reduce UNBLOCKED**: `CCL_ATL_TRANSPORT=mpi`+`I_MPI_FABRICS=shm`+
   `CCL_SYCL_COPY_ENGINE=1`+B70 block via `mpiexec` → 512 MiB in 0.03 s (~36 GB/s), PASS
-- [ ] **XPU-optimized training path** (the greater value): FSDP-sharded all-on-XPU
-  MTP trainer (27B not fully resident on one card) + the copy-engine large-allreduce fix
+- [x] **XPU-optimized training path**: FSDP-sharded (device_map) all-on-XPU MTP
+  trainer — 27B sharded across cards 2,3 (no card holds the full 54GB), MTP head on
+  the last card sharing the main embed (no 2.4GB local copy → no OOM). **Verified
+  running with per-step logging:** epoch 0 in 199s, val 0.4207 → 0.4778 (+5.7pp),
+  per-step loss + batch-acc every 50 steps, no CPU h_i round-trip.
 
 ## Next (priority: build the XPU-optimized training path — the greater value)
 
