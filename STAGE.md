@@ -52,17 +52,27 @@ affinity mask). Never let a training/rollout process grab cards 0/1.
 > profiler registration that a hand-rolled draft misses. Install it into the venv
 > (`pip install -e .`) and verify `get_platform()` returns `xpu intel xccl`.
 
-## MTP head finetune (DONE — see `mtp_work/MTP_FT.md`)
+## MTP head finetune (diverse eval — see `mtp_work/MTP_FT.md`)
 
-Reconstructed the `mtp.*` head the base model ignores, measured its acceptance, and
-finetuned it — all on the free cards, serving lane untouched:
+Reconstructed the `mtp.*` head the base model ignores, then finetuned it on a
+**domain-matched** corpus (json / python / tool_call / prose) and evaluated on a
+**disjoint held-out test set** (no sequence shared with train/val) — the unbiased
+number, all on the free cards, serving lane untouched:
 
-- **Baseline acceptance: 34.55%** (WikiText-103 TEST, 32,256 positions).
-- **Finetuned (6 epochs): 35.56%** — a +1.0pp (~2.9% relative) improvement.
-- Memory-safe two-phase training (full model on cards to harvest `h_i`, then the small
-  MTP head trains alone on one card) — a naive 54GB in-RAM load OOMs the host and kills
-  the serving lane, so every run is RAM-watchdog-guarded.
-- Finetuned head: `~/models/swift-27b-mtp-ft/mtp_head_final.pt`.
+| Task | Baseline → Finetuned | Delta | Verdict |
+|------|----------------------|------:|---------|
+| json | 41.3% → 58.5% | **+17.2pp** | significant |
+| tool_call | 57.3% → 83.9% | **+26.7pp** | significant |
+| python | 42.2% → 39.6% | **−2.6pp** | **regressed** |
+| prose | 34.3% → 34.5% | +0.2pp | noise |
+| **OVERALL** | 41.7% → 49.3% | **+7.6pp** | significant |
+
+The distribution-matched finetune is a real, significant **+7.6pp overall** with large
+gains on the structured domains, **but it is not uniform** — python regressed and prose
+is flat, i.e. the head overfit the train mix. Next iteration: broader/balanced corpus
+(Nemotron text for prose, more diverse python) + stronger regularization, re-measured on
+the disjoint test set. Memory-safe two-phase training (RAM-watchdog-guarded); finetuned
+head at `~/models/swift-27b-mtp-ft/mtp_head_final.pt`.
 
 ## XPU smoke test (DONE — plugin verified end-to-end)
 
@@ -79,33 +89,42 @@ Installed `verl-hardware-plugin` into the venv and verified the full stack on ca
 - **Device pinning works**: `ZE_AFFINITY_MASK=2,3` + `ONEAPI_DEVICE_SELECTOR` unset keeps
   every process on the free pair.
 
-**oneCCL transport gotcha (the real blocker for real-model runs):** this host has no
+**oneCCL transport reality (the blocker for real-model runs):** this host has no
 usable OFI/RDMA provider (`fi_getinfo` returns 0), so the default OFI transport fails to
-init. The fix is the **MPI transport**: `CCL_ATL_TRANSPORT=mpi` + `ONEAPI_ROOT=$VENV`
-(satisfies oneCCL's `check_impi_env`) + `I_MPI_FABRICS=shm`, launched via `mpiexec`
-(oneCCL needs a real MPI bootstrap; torchrun doesn't provide one). The `shm` fabric
-handles small collectives (the minimal FSDP test) but **deadlocks on real-model-sized
-(~1GB) gradient all-reduces** — so a full SFT/GRPO run of a real model hangs in the
-backward. That's a limitation of the venv's self-contained oneCCL/IMPI stack (built for
-OFI/RDMA), not of the plugin. A host with RDMA (or a oneCCL with a working software
-provider) would clear it.
+init. The venv's oneCCL (2021.16.1) exposes only `ofi`/`mpi`/`shm` as `CCL_ATL_TRANSPORT`
+— there is **no `sycl` transport**. The `CCL_SYCL_*` strings are the SYCL *device
+backend* (GPU-side kernels) that runs *within* a transport. The `shm`/`mpi` fabrics
+handle small collectives but **deadlock on real-model-sized (~1GB) all-reduces** because
+they shuttle data through host memory on the compute path. **The fix under test:**
+`CCL_ATL_TRANSPORT=shm` + `CCL_SYCL_COPY_ENGINE=1` (+ the B70 block: `CCL_SYCL_ALLREDUCE_LL=ring`,
+`CCL_SYCL_ALLREDUCE_SIMPLE_READ=1`, three `*_SIMPLE_THRESHOLD=4294967296`,
+`CCL_SYCL_ALLTOALL_TMP_BUF=1`) so large all-reduces use the **DMA copy-engine path**
+instead of the deadlocking compute path. Probe: `scripts/xpu/test_large_allreduce.py`
+(512MiB all-reduce) + `scripts/xpu/launch-large-ar.sh`. A host with RDMA (or a newer
+oneCCL with a working software provider) would clear it more cleanly.
 
 ## Status
 
 - [x] Model staged (`~/models/swift-27b`), original intact
 - [x] Venv with working torch-XPU (4 devices visible)
-- [x] MTP head reconstructed + baseline measured (34.55%)
-- [x] MTP head finetuned (35.56%) — `~/models/swift-27b-mtp-ft/`
+- [x] MTP head reconstructed + diverse finetune: **+7.6pp overall** on disjoint test
+  (json +17.2, tool_call +26.7 significant; python −2.6 regressed; prose noise)
 - [x] Core-tree `PlatformXPU` draft reverted (use official `verl-hardware-plugin`)
 - [x] `verl-hardware-plugin` installed + `get_platform()` → `xpu/intel/xccl`
 - [x] XPU smoke test: xccl collectives + FSDP engine + device pinning verified on 2,3
-- [ ] Real-model FSDP run (blocked by oneCCL `shm` fabric large-all-reduce deadlock)
+- [ ] **XPU-optimized training path** (the greater value): all-on-XPU single-phase
+  trainer (no CPU `h_i` round-trip) + `CCL_SYCL_COPY_ENGINE` large-allreduce fix
+- [ ] Real-model FSDP run (gated on the `CCL_ATL_TRANSPORT=shm` + copy-engine probe)
 
-## Next
+## Next (priority: build the XPU-optimized training path — the greater value)
 
-1. To run a real model end-to-end, the oneCCL transport needs a working provider:
-   either RDMA/OFI on the host, or a oneCCL build with a software (tcp/sockets) provider
-   that handles large all-reduces. The plugin itself is ready.
-2. Pick the training engine (FSDP) and wire a `ppo_trainer`/`sft_trainer` config for
-   `device=xpu`, 2 GPUs, once the transport is sorted.
-3. Smoke-test end-to-end on cards 2,3 before scaling.
+1. **All-on-XPU single-phase MTP trainer** (`mtp_work/train_mtp3.py`): keep the frozen
+   27B + the MTP head on the cards and compute `h_i` on the fly — no CPU round-trip.
+   This is the shape verl's FSDP engine uses and removes the phase-2 CPU bottleneck.
+2. **Land the large-allreduce fix:** `CCL_ATL_TRANSPORT=shm` + `CCL_SYCL_COPY_ENGINE=1`
+   (+ B70 block). Validate with `scripts/xpu/test_large_allreduce.py`, then
+   `scripts/xpu/smoke-sft-2gpu.sh` for a real-model FSDP run on cards 2,3.
+3. **Iterate the MTP finetune** to fix the python regression + prose: broader/balanced
+   corpus (Nemotron text) + stronger regularization, re-measured on the disjoint test set.
+4. Wire a `sft_trainer`/`ppo_trainer` config for `device=xpu`, 2 GPUs, once the
+   transport + all-on-XPU path are in.

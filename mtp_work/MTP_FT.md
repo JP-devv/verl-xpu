@@ -62,22 +62,35 @@ cards, and CPU-offloading the main model reintroduces fragile meta-tensor states
 - **Phase 2:** load just `embed_tokens` + `lm_head` + the MTP head onto ONE card (frozen
   embed/lm_head, trainable MTP head) and train against the saved `h_i` (AdamW, lr=1e-4).
 
-## Results (WikiText-103 TEST split, 256 seqs x 128 = 32,256 positions)
+## Diverse evaluation (disjoint held-out TEST set)
 
-| MTP head | Acceptance |
-|---|---|
-| **Original (baseline)** | **34.55%** (11146/32256) |
-| Finetuned, 3 epochs | 35.13% (11330/32256) |
-| **Finetuned, 6 epochs** | **35.56%** (11470/32256) |
+The WikiText-only number above is superseded. We now evaluate on a **disjoint**
+`diverse_test.jsonl` (254 seqs, 24,856 positions) that shares **no** sequence with the
+train or val sets — so the finetuned head was never trained on or selected against it.
+This is the unbiased generalization estimate. Both heads are measured on the identical
+sequences by `measure_mtp.py`.
 
-The finetuned head beats the original by **+1.0pp (~2.9% relative)** on the held-out test
-split. Training loss dropped 3.97 -> 0.30 over 6 epochs.
+| Task | Baseline | Finetuned | Delta | z | 95% CI of delta | Verdict |
+|------|---------:|----------:|------:|-----:|:----------------|:--------|
+| json      | 0.4134 (3053/7385)  | 0.5852 (4322/7385)  | **+0.1718** | 21.2 | [+0.156, +0.188] | significant + |
+| tool_call | 0.5726 (1746/3049)  | 0.8393 (2559/3049)  | **+0.2666** | 23.9 | [+0.245, +0.289] | significant + |
+| python    | 0.4215 (3330/7900)  | 0.3956 (3125/7900)  | **−0.0259** | −3.3 | [−0.041, −0.011] | **significant −** |
+| prose     | 0.3431 (2238/6522)  | 0.3451 (2251/6522)  | +0.0020 | 0.24 | [−0.014, +0.018] | noise |
+| **OVERALL** | 0.4171 (10367/24856) | 0.4931 (12257/24856) | **+0.0760** | 17.1 | [+0.067, +0.085] | significant + |
 
-## Caveats
+**Read:** the distribution-matched finetune gives a real, significant **+7.6pp overall**
+and large gains on the structured domains (json +17.2pp, tool_call +26.7pp). But it is
+**not uniform**: **python regressed −2.6pp (significant)** and **prose is within noise**.
+The val-set gain (+9.6pp) was inflated by early-stopping selection bias; the disjoint
+test set is the honest number.
 
-- Training/eval are on WikiText-103 (a proxy corpus). The real serving distribution
-  (agent/code tasks) differs, so the on-WikiText gain is a lower bound on what a
-  distribution-matched finetune would give.
-- The gain is modest because the shipped head is already a decent predictor; MTP acceptance
-  is a hard argmax metric that improves slowly with CE training.
+## Caveats / next iteration
+
+- **Overfit to the train/val distribution:** the head helps json/tool_call but hurts
+  python and leaves prose flat — a sign the margin loss + CE is overfitting the specific
+  train mix rather than generalizing. The fix is a broader, more balanced train corpus
+  (e.g. Nemotron post-training text for prose; more diverse python) and/or a stronger
+  regularizer, then re-measure on the disjoint test set.
+- **Two-phase is CPU-bound:** phase 2 shuttles `h_i` CPU→XPU each step and a 424M head
+  can't saturate a B70. The all-on-XPU single-phase trainer (below) removes that.
 - To deploy: load `mtp_head_final.pt` into the `MTPHead` in the serving stack's MTP path.
