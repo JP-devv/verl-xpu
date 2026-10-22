@@ -94,3 +94,21 @@ test set is the honest number.
 - **Two-phase is CPU-bound:** phase 2 shuttles `h_i` CPU→XPU each step and a 424M head
   can't saturate a B70. The all-on-XPU single-phase trainer (below) removes that.
 - To deploy: load `mtp_head_final.pt` into the `MTPHead` in the serving stack's MTP path.
+
+## Standalone all-on-XPU MTP-head run (2 GPU, cards 2,3) — PASS
+
+`train_mtp3.py`: frozen 27B sharded across cards 2,3 via `device_map`, MTP head on the
+last card sharing `embed_tokens`, no CPU h_i round-trip. Main `.venv` (torch 2.9.1+xpu,
+oneCCL 2021.16.1). 998 train / 254 val seqs, CE + margin loss.
+
+| epoch | time  | final loss | val acc  |
+|-------|-------|-----------|----------|
+| base  | —     | —         | 0.4201   |
+| 0     | 200s  | 1.4355    | 0.4781   |
+| 1     | 199s  | 0.5120    | 0.4827   |
+| 2     | 200s  | 0.9915    | 0.4893   |
+| 3     | 199s  | 0.4924    | 0.4962   |
+| 4     | 199s  | 0.1721    | **0.5029** |
+
+**+8.3 pp** over 5 epochs. Peak XPU mem card 2: 32566/32656 MiB (99.7%). 1 GPU infeasible
+(27B bf16 ≈ 54 GB > 32 GB/card); 2 GPU minimum; 4 GPU blocked by serving lane.

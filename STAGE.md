@@ -201,6 +201,31 @@ nor the venv provides. The only clean path to native XCCL is a torch build match
 the working 0.5 B FSDP SFT uses. Main `.venv` reverted to the known-good 2021.16.1 state
 (`.venv/lib/xpu2021/` preserved for reference).
 
+**Standalone all-on-XPU Swift-27B MTP-head run — PASS (2 GPU, cards 2,3).**
+`mtp_work/train_mtp3.py` (frozen 27B sharded across cards 2,3 via `device_map`, MTP head
+on the last card sharing `embed_tokens`, no CPU h_i round-trip) runs cleanly on the main
+`.venv` (torch 2.9.1+xpu, oneCCL 2021.16.1). Executed result (998 train / 254 val seqs,
+CE + margin loss, log every 50 steps):
+
+| epoch | time  | final loss | val acc  | best     |
+|-------|-------|-----------|----------|----------|
+| base  | —     | —         | 0.4201   | 0.4201   |
+| 0     | 200s  | 1.4355    | 0.4781   | 0.4781   |
+| 1     | 199s  | 0.5120    | 0.4827   | 0.4827   |
+| 2     | 200s  | 0.9915    | 0.4893   | 0.4893   |
+| 3     | 199s  | 0.4924    | 0.4962   | 0.4962   |
+| 4     | 199s  | 0.1721    | **0.5029** | 0.5029  |
+
+**+8.3 pp** val acceptance over 5 epochs (0.4201 → 0.5029), loss 1.44 → 0.17, ~199 s/epoch.
+Peak XPU mem: card 2 at **32566 / 32656 MiB (99.7 %)** — the 27 B bf16 is sharded tight
+across the two 32 GB cards. **1/2/4-GPU scaling for the 27 B MTP head:** 1 GPU is
+**infeasible** (27 B bf16 ≈ 54 GB > 32 GB/card, so the backbone cannot fit on a single
+B70); **2 GPU (cards 2,3) is the minimum and works** (above); **4 GPU is blocked by the
+serving lane** (cards 0,1 run the live vLLM). The 0.5 B FSDP SFT scaling (1 GPU 5.95 it/s,
+2 GPU 4.0 it/s, 1.35× wall-clock) remains the small-model reference; the 27 B MTP head has
+far more per-step compute, so its 2-GPU utilization is compute-bound (100 % GPU util) rather
+than collective-bound.
+
 **oneCCL 2022.0.0 upgrade — ATTEMPTED, INCOMPATIBLE with torch 2.9.1+xpu (reverted).**
 Tried to move off the 2021.16.1/`mpi` stack to oneCCL 2022.0.0 (native XCCL) to fix the
 FSDP-backward crash. oneCCL is a standalone Intel pip package, so a `--no-deps` install of
