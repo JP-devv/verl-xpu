@@ -89,19 +89,27 @@ Installed `verl-hardware-plugin` into the venv and verified the full stack on ca
 - **Device pinning works**: `ZE_AFFINITY_MASK=2,3` + `ONEAPI_DEVICE_SELECTOR` unset keeps
   every process on the free pair.
 
-**oneCCL transport reality (the blocker for real-model runs):** this host has no
-usable OFI/RDMA provider (`fi_getinfo` returns 0), so the default OFI transport fails to
-init. The venv's oneCCL (2021.16.1) exposes only `ofi`/`mpi`/`shm` as `CCL_ATL_TRANSPORT`
-— there is **no `sycl` transport**. The `CCL_SYCL_*` strings are the SYCL *device
-backend* (GPU-side kernels) that runs *within* a transport. The `shm`/`mpi` fabrics
-handle small collectives but **deadlock on real-model-sized (~1GB) all-reduces** because
-they shuttle data through host memory on the compute path. **The fix under test:**
-`CCL_ATL_TRANSPORT=shm` + `CCL_SYCL_COPY_ENGINE=1` (+ the B70 block: `CCL_SYCL_ALLREDUCE_LL=ring`,
-`CCL_SYCL_ALLREDUCE_SIMPLE_READ=1`, three `*_SIMPLE_THRESHOLD=4294967296`,
-`CCL_SYCL_ALLTOALL_TMP_BUF=1`) so large all-reduces use the **DMA copy-engine path**
-instead of the deadlocking compute path. Probe: `scripts/xpu/test_large_allreduce.py`
-(512MiB all-reduce) + `scripts/xpu/launch-large-ar.sh`. A host with RDMA (or a newer
-oneCCL with a working software provider) would clear it more cleanly.
+**oneCCL transport — SOLVED (large all-reduce now works).** This host has no usable
+OFI/RDMA provider (`fi_getinfo` returns 0), so the default OFI transport fails to init.
+The venv's oneCCL (2021.16.1) `CCL_ATL_TRANSPORT` accepts **only `ofi` | `mpi`** — there
+is no `sycl` transport and **no `shm` transport** (`shm` is a *fabric* inside the `mpi`
+transport, set via `I_MPI_FABRICS=shm`). The `CCL_SYCL_*` strings tune the SYCL *device
+backend* (GPU-side kernels) that runs within a transport. The old `mpi`+`shm` path
+deadlocked on ~1GB all-reduces because it moved data through host memory on the compute
+path. **The working recipe (validated):**
+```
+CCL_ATL_TRANSPORT=mpi  I_MPI_FABRICS=shm  ONEAPI_ROOT=$VENV   # real MPI transport + shm fabric
+CCL_SYCL_COPY_ENGINE=1                                # large moves over the DMA copy-engine
+CCL_SYCL_ALLREDUCE_LL=ring  CCL_SYCL_ALLREDUCE_SIMPLE_READ=1
+CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD=4294967296  CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD=4294967296
+CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD=4294967296  CCL_SYCL_ALLTOALL_TMP_BUF=1
+```
+launched via **`mpiexec -n 2`** (the oneCCL mpi transport needs a real MPI bootstrap;
+torchrun yields "Duplicate ranks"), with `ZE_AFFINITY_MASK=2,3` and `ONEAPI_DEVICE_SELECTOR`
+unset. **Result: 512 MiB bf16 all-reduce in 0.03 s (~36 GB/s), correct sum — PASS**
+(`scripts/xpu/test_large_allreduce.py` + `scripts/xpu/launch-large-ar.sh` +
+`scripts/xpu/mpi-ar-wrapper.sh`). This unblocks real-model FSDP on cards 2,3. A host with
+RDMA (or a newer oneCCL with a software provider) would be cleaner, but this is enough.
 
 ## Status
 
@@ -112,9 +120,10 @@ oneCCL with a working software provider) would clear it more cleanly.
 - [x] Core-tree `PlatformXPU` draft reverted (use official `verl-hardware-plugin`)
 - [x] `verl-hardware-plugin` installed + `get_platform()` → `xpu/intel/xccl`
 - [x] XPU smoke test: xccl collectives + FSDP engine + device pinning verified on 2,3
-- [ ] **XPU-optimized training path** (the greater value): all-on-XPU single-phase
-  trainer (no CPU `h_i` round-trip) + `CCL_SYCL_COPY_ENGINE` large-allreduce fix
-- [ ] Real-model FSDP run (gated on the `CCL_ATL_TRANSPORT=shm` + copy-engine probe)
+- [x] **Large all-reduce UNBLOCKED**: `CCL_ATL_TRANSPORT=mpi`+`I_MPI_FABRICS=shm`+
+  `CCL_SYCL_COPY_ENGINE=1`+B70 block via `mpiexec` → 512 MiB in 0.03 s (~36 GB/s), PASS
+- [ ] **XPU-optimized training path** (the greater value): FSDP-sharded all-on-XPU
+  MTP trainer (27B not fully resident on one card) + the copy-engine large-allreduce fix
 
 ## Next (priority: build the XPU-optimized training path — the greater value)
 
