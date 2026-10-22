@@ -282,6 +282,12 @@ class FSDPEngine(BaseEngine):
                     torch_dtype=torch_dtype,
                     config=self.model_config.hf_config,
                     trust_remote_code=self.model_config.trust_remote_code,
+                    # Stream weights shard-by-shard into the (meta) init context so a
+                    # large model (e.g. 52GB Swift-27B) is NOT materialized whole in
+                    # host RAM on the loading rank — that OOMs the shared host and can
+                    # kill the serving lane. low_cpu_mem_usage pairs with the
+                    # init_empty_weights context from get_init_weight_context_manager.
+                    low_cpu_mem_usage=True,
                 )
 
                 # Strip sub-modules listed in _verl_strip_modules (e.g.

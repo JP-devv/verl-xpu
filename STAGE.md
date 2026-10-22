@@ -156,6 +156,30 @@ hits EDQUOT) — point `TMPDIR` at `/var/tmp`.
   per GPU, so the collective fraction shrinks and the 2-GPU speedup should approach the ideal.
   Memory scales down as expected (11.7 GB → 6.7 GB/rank) — FSDP sharding is working.
 
+**Swift-27B MTP-head FSDP SFT — BLOCKED by a torchrun-agent SIGHUP during the model load
+(NOT a RAM issue).** Wired the MTP head into verl's FSDP SFT path via a remote-code model
+class (`mtp_work/modeling_qwen3_5_mtp.py`: `Qwen3_5MTPHead` = 424.7 M trainable MTP head +
+27.36 B frozen backbone, loaded via `auto_map` + `trust_remote_code`), with
+`scripts/xpu/smoke-mtp-2gpu.sh` (2-GPU, `ZE_AFFINITY_MASK=2,3`, cards 2,3). Patched
+`verl/workers/engine/fsdp/transformer_impl.py::_build_module` to pass
+`low_cpu_mem_usage=True` to `from_pretrained` (streams weights shard-by-shard into the
+meta-tensor init context). A bounded load-probe (`mtp_work/load_probe.py`) confirmed the
+low-CPU-mem load keeps host RAM bounded: 2 shards (3.5 B params, 6.5 GB) → **peak RSS
+0.5 GB**, free stayed 51.8 GB; full 18-shard model est. ~5 GB peak. **But the 2-process
+torchrun FSDP load dies at ~37% (437/1184 tensors) with `SignalException: Process
+<agent-pid> got signal: 1` (SIGHUP) on the torchrun *agent* process** — reproduced
+consistently, **even with `setsid`** (fully detached from the controlling terminal), and
+with 53 GB host RAM free. So it is **not** an OOM and **not** a worker crash: the elastic
+agent itself receives a SIGHUP mid-load and tears down the workers. The single-process
+load (no torchrun agent) works fine, which isolates the fault to the torchrun elastic
+agent's signal handling on this host. **Next concrete fix:** launch the 2 ranks via a
+manual `env://` bootstrap (set `RANK`/`WORLD_SIZE`/`LOCAL_RANK`/`MASTER_*` and run
+`python -m verl.trainer.sft_trainer` directly, no `torchrun` agent) to bypass the
+SIGHUP-prone elastic agent; if that also dies at ~37%, capture `dmesg` / `py-spy dump`
+on the agent PID at the crash to identify the SIGHUP sender. Until then the 27B MTP-head
+FSDP run is blocked; the 0.5 B FSDP SFT (small model, loads before the SIGHUP window)
+remains the working XPU FSDP proof.
+
 **oneCCL 2022.0.0 upgrade — ATTEMPTED, INCOMPATIBLE with torch 2.9.1+xpu (reverted).**
 Tried to move off the 2021.16.1/`mpi` stack to oneCCL 2022.0.0 (native XCCL) to fix the
 FSDP-backward crash. oneCCL is a standalone Intel pip package, so a `--no-deps` install of
