@@ -180,6 +180,27 @@ on the agent PID at the crash to identify the SIGHUP sender. Until then the 27B 
 FSDP run is blocked; the 0.5 B FSDP SFT (small model, loads before the SIGHUP window)
 remains the working XPU FSDP proof.
 
+**oneCCL 2022.0.0 layered onto the main `.venv` (torch 2.9.1+xpu) — ATTEMPTED, exact
+`NEEDED`/`RPATH` blocker recorded, reverted.** Goal: keep torch 2.9.1 (which needs the
+2021.16.1 SYCL runtime) but gain the 2022.0.0 native-XCCL CCL. Procedure: (1) preserved the
+2021.16.1 `libsycl.so.8`/`libccl.so.1`/`libmkl_sycl_*.so.5` in `.venv/lib/xpu2021/`;
+(2) `pip install --no-deps oneccl==2022.0.0`; (3) intended to prepend `xpu2021/` to
+`LD_LIBRARY_PATH`. **Blocker:** the 2022.0.0 wheel ships **no `libsycl.so.9`** (only
+`libccl.so.1/.2`, `libccl_legacy*.so`, SPV kernels) and its `libccl.so*` binaries carry a
+`NEEDED libsycl.so.9` entry with `RPATH $ORIGIN/../../../..` → `.venv/lib/`, which only
+contains `libsycl.so.8`. So `import torch` (`torch._C` → `libtorch.so` → `libccl.so.1`)
+dies with `ImportError: libsycl.so.9: cannot open shared object file`. Restoring the
+2021.16.1 `libccl.so.1` fixes the import (torch.xpu back to 4 devices) but that CCL is the
+old 2021.16.1 build — torch 2.9.1 is compiled against the `libccl.so.1` SONAME, and the
+2022.0.0 native-XCCL CCL is a *different* SONAME (`libccl.so.2`) that torch 2.9.1 will not
+load. **Conclusion: you cannot graft 2022.0.0's native XCCL onto torch 2.9.1 by
+`LD_LIBRARY_PATH` alone** — torch 2.9.1's `libtorch.so` hard-binds `libccl.so.1` (2021.16.1,
+`libsycl.so.8`), and 2022.0.0's CCL needs a `libsycl.so.9` runtime that neither the wheel
+nor the venv provides. The only clean path to native XCCL is a torch build matched to
+2022.0.0 (i.e. the throwaway `.venv-xpu2026` with torch 2.13.0+xpu), which is exactly what
+the working 0.5 B FSDP SFT uses. Main `.venv` reverted to the known-good 2021.16.1 state
+(`.venv/lib/xpu2021/` preserved for reference).
+
 **oneCCL 2022.0.0 upgrade — ATTEMPTED, INCOMPATIBLE with torch 2.9.1+xpu (reverted).**
 Tried to move off the 2021.16.1/`mpi` stack to oneCCL 2022.0.0 (native XCCL) to fix the
 FSDP-backward crash. oneCCL is a standalone Intel pip package, so a `--no-deps` install of
