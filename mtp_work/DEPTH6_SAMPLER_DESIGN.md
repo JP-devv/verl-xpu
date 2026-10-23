@@ -38,3 +38,11 @@ After a depth-6 result is measured, test whether training at depths above six im
 ## Validation
 
 CPU checks cover cached-versus-full causal attention equivalence, blocked projection NLL and gradients, filtered-policy overlap, six-step loss gradients, absolute token positions, and capture alignment. They do not validate XPU training speed, live sampler behavior, or serving acceptance.
+
+## First AI01 run and memory adjustment
+
+The first sampler-matched AI01 launch loaded **128,512 six-step rollouts** from the existing **775,899 training labels** and **675 held-out rollouts** (4,050 covered labels), using the verified production sampler above. The untrained parent baseline measured **1.390 expected accepted tokens per six-token proposal** on the root-disjoint held-out set. This is an offline captured-context proxy, not a live vLLM acceptance result.
+
+That launch used 64 rollouts per optimizer batch and stopped before its first update when host available memory fell to **1.29 GiB**; swap use was **1.64 GB**, while the training container recorded **zero OOM kills**. No checkpoint or trained result was produced by that attempt. The bounded-memory change in `hermes_rollout.py` recomputes vocabulary projection blocks during top-k backward instead of retaining every block's autograd intermediates. The dense-reference CPU check confirms matching top-k values and close gradients. The follow-up run also reduces the rollout batch, so the first launch's resource guard is not mistaken for a training result.
+
+The production vLLM container was restored and its health and model endpoints returned HTTP 200 after the stopped run. Training still needs a successful optimizer update and a matched live serving comparison before the method can be judged.
