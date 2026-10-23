@@ -52,8 +52,14 @@ class MTPHead(nn.Module):
         self.embed_dev = next(embed_tokens.parameters()).device
         self.lmhead_dev = next(lm_head.parameters()).device
 
-    def forward(self, h, token_ids, positions=None):
-        """h: [N,H] main post-norm hidden states; token_ids: [N] tokens t_{i+1}."""
+    def forward_hidden(self, h, token_ids, positions=None, past_key_values=None):
+        """Return the recurrent MTP state before the shared vocabulary head.
+
+        With ``past_key_values`` this is the deployed speculative recurrence:
+        each accepted draft token reuses the same MTP decoder layer and appends
+        one key/value position.  The layer is deliberately still a single layer
+        and adds no checkpoint tensors.
+        """
         cdev = next(self.fc.parameters()).device  # MTP compute device
         e = self.embed_tokens(token_ids.to(self.embed_dev)).to(cdev)  # [N,H]
         e_n = self.pre_fc_norm_embedding(e)
@@ -65,15 +71,30 @@ class MTPHead(nn.Module):
         elif positions.ndim == 1:
             positions = positions.unsqueeze(1).to(cdev)
         cos, sin = self.rotary(x, positions)
+        attention_mask = None
+        if past_key_values is not None:
+            past_len = past_key_values.get_seq_length(0)
+            # Every row in a rollout batch has the same six-step cache length.
+            # All cached positions are causal predecessors, so an additive zero
+            # mask is the exact one-query causal mask for this recurrent step.
+            attention_mask = torch.zeros(
+                (x.shape[0], 1, 1, past_len + 1), device=cdev, dtype=x.dtype
+            )
         out = self.layer(
             hidden_states=x,
             position_embeddings=(cos, sin),
             position_ids=positions,
-            attention_mask=None,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
         )
-        out = self.norm(out)
-        logits = self.lm_head(out.to(self.lmhead_dev))  # [N,1,V] on lm_head device
-        return logits.squeeze(1).to(cdev)  # [N, V]
+        return self.norm(out).squeeze(1)
+
+    def forward(self, h, token_ids, positions=None, past_key_values=None):
+        """Return vocabulary logits; supports optional recurrent rollout cache."""
+        cdev = next(self.fc.parameters()).device
+        out = self.forward_hidden(h, token_ids, positions, past_key_values)
+        logits = self.lm_head(out.to(self.lmhead_dev))  # [N,V] on lm_head device
+        return logits.to(cdev)  # [N, V]
 
     # ------------------------------------------------------------------
     def load_mtp_state(self, mtp_state: dict) -> dict:
