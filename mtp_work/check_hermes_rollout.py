@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU checks for exact recurrent cache use and the depth-6 acceptance loss."""
 import os
+import copy
 from array import array
 from pathlib import Path
 import sys
@@ -179,6 +180,48 @@ def main():
         metrics['per_depth_prefix_acceptance'][0]
     )
 
+    # Splitting the effective batch must preserve the exact mean objective,
+    # reported metrics, and accumulated parameter gradients.
+    full_head, micro_head = copy.deepcopy(head), copy.deepcopy(head)
+    full_head.zero_grad(set_to_none=True)
+    micro_head.zero_grad(set_to_none=True)
+    with torch.autocast('cpu', dtype=torch.bfloat16):
+        full_loss, full_metrics = verifier_rollout_loss(
+            full_head, initial, first, verifier, absolute, projection,
+            rollout_tokens=rollout_tokens,
+        )
+    full_loss.backward()
+    micro_loss_sum = torch.zeros_like(full_loss)
+    micro_metrics_sum = None
+    for lo in range(0, batch, 1):
+        hi = lo + 1
+        with torch.autocast('cpu', dtype=torch.bfloat16):
+            micro_loss, micro_metrics = verifier_rollout_loss(
+                micro_head, initial[lo:hi], first[lo:hi], verifier[lo:hi],
+                absolute[lo:hi], projection,
+                rollout_tokens=rollout_tokens[lo:hi],
+            )
+        (micro_loss * ((hi - lo) / batch)).backward()
+        micro_loss_sum.add_(micro_loss.detach(), alpha=(hi - lo) / batch)
+        if micro_metrics_sum is None:
+            micro_metrics_sum = {
+                key: value.detach() * ((hi - lo) / batch)
+                for key, value in micro_metrics.items()
+            }
+        else:
+            for key, value in micro_metrics.items():
+                micro_metrics_sum[key].add_(value.detach(), alpha=(hi - lo) / batch)
+    accumulation_error = max(
+        float((left.grad.float() - right.grad.float()).abs().max())
+        for left, right in zip(full_head.parameters(), micro_head.parameters())
+    )
+    metric_error = max(float((full_metrics[key] - micro_metrics_sum[key]).abs().max())
+                       for key in full_metrics)
+    loss_error = float((full_loss.detach() - micro_loss_sum).abs())
+    assert accumulation_error < 1e-4 and metric_error < 2e-6 and loss_error < 2e-6, (
+        accumulation_error, metric_error, loss_error
+    )
+
     with tempfile.TemporaryDirectory() as directory:
         ids = list(range(20, 34))
         record = {'sid': 'rollout-fixture', 'w': 'capture', 'split': 'train',
@@ -218,6 +261,8 @@ def main():
            'streamed_topk_max_error': top_error, 'streamed_topk_grad_max_error': top_grad_error,
            'combined_topk_nll_max_errors': [combined_value_error, combined_nll_error,
                                             combined_separate_grad_error],
+           'microbatch_accumulation_max_errors': [loss_error, metric_error,
+                                                   accumulation_error],
            'hard_accepted_length': float(metrics['hard_accepted_length']),
            'expected_accepted': float(metrics['expected_accepted']),
            'trainable_tensors': len(list(head.parameters())),

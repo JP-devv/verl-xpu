@@ -64,6 +64,9 @@ def main():
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--lr', type=float, default=2e-5)
     p.add_argument('--batch-rollouts', type=int, default=8)
+    p.add_argument('--microbatch-rollouts', type=int, default=0,
+                   help=('Forward/backward slice size for the effective batch. '
+                         '0 uses the full batch; smaller values accumulate exact mean-loss gradients.'))
     p.add_argument('--depth', type=int, default=6)
     p.add_argument('--temperature', type=float, default=1.0)
     p.add_argument('--top-k', type=int, default=20)
@@ -93,6 +96,11 @@ def main():
         raise ValueError('--reset-optimizer-on-resume requires --resume')
     if a.skip_smoke_eval and not a.max_updates:
         raise ValueError('--skip-smoke-eval requires an explicit --max-updates bound')
+    if a.microbatch_rollouts < 0 or (a.microbatch_rollouts and
+                                     a.microbatch_rollouts > a.batch_rollouts):
+        raise ValueError('--microbatch-rollouts must be zero or no larger than --batch-rollouts')
+    if a.vocabulary_chunk <= 0:
+        raise ValueError('--vocabulary-chunk must be positive')
     assert torch.xpu.is_available(), 'XPU required; no CPU/CUDA training fallback'
     if a.depth != 6:
         raise ValueError('This training recipe is defined for deployed draft depth 6')
@@ -225,6 +233,8 @@ def main():
             'sampler': {'source': a.sampler_source, 'temperature': a.temperature,
                         'top_k': a.top_k, 'top_p': a.top_p},
             'depth': a.depth, 'ce_weight': a.ce_weight, 'lr': a.lr,
+            'batch_rollouts': a.batch_rollouts,
+            'microbatch_rollouts': a.microbatch_rollouts or a.batch_rollouts,
             'optimizer_name': optimizer_name,
             'optimizer_reset_at_step': optimizer_reset_at_step,
             'model': head.state_dict(), 'optimizer': optimizer.state_dict(),
@@ -285,20 +295,47 @@ def main():
         update_cpu_t0 = time.process_time()
         lo, hi = cursor, min(cursor + a.batch_rollouts, len(order))
         indices = order[lo:hi]
+        # Load and transfer each effective batch once, then retain only one
+        # microbatch's recurrent graph for backward at a time. Losses are
+        # means, so weighting each microbatch by its share gives the exact
+        # full-batch gradient while bounding saved recurrent activations.
         initial, first, teacher, positions = train_store.batch(indices, device)
         rollout_tokens = train_store.continuation_batch(indices, device)
         data_seconds = time.monotonic() - update_t0
         optimizer.zero_grad(set_to_none=True)
         t0 = time.monotonic()
-        with torch.autocast('xpu', dtype=torch.bfloat16):
-            loss, metrics = verifier_rollout_loss(
-                head, initial.to(torch.bfloat16), first, teacher,
-                positions, projection, a.ce_weight, rollout_tokens=rollout_tokens,
-                temperature=a.temperature, top_k=a.top_k, top_p=a.top_p
-            )
-        if not torch.isfinite(loss):
-            raise FloatingPointError('Non-finite verifier-rollout objective')
-        loss.backward()
+        microbatch_size = a.microbatch_rollouts or len(indices)
+        metric_sums = None
+        loss_sum = None
+        for micro_lo in range(0, len(indices), microbatch_size):
+            micro_hi = min(micro_lo + microbatch_size, len(indices))
+            weight = (micro_hi - micro_lo) / len(indices)
+            sl = slice(micro_lo, micro_hi)
+            initial_xpu = initial[sl].to(dtype=torch.bfloat16)
+            first_xpu = first[sl]
+            teacher_xpu = teacher[sl]
+            positions_xpu = positions[sl]
+            rollout_xpu = rollout_tokens[sl]
+            with torch.autocast('xpu', dtype=torch.bfloat16):
+                micro_loss, micro_metrics = verifier_rollout_loss(
+                    head, initial_xpu, first_xpu, teacher_xpu,
+                    positions_xpu, projection, a.ce_weight, rollout_tokens=rollout_xpu,
+                    temperature=a.temperature, top_k=a.top_k, top_p=a.top_p
+                )
+            if not torch.isfinite(micro_loss):
+                raise FloatingPointError('Non-finite verifier-rollout objective')
+            (micro_loss * weight).backward()
+            loss_sum = micro_loss.detach() * weight if loss_sum is None else (
+                loss_sum + micro_loss.detach() * weight)
+            if metric_sums is None:
+                metric_sums = {key: value.detach() * weight
+                               for key, value in micro_metrics.items()}
+            else:
+                for key, value in micro_metrics.items():
+                    metric_sums[key].add_(value.detach(), alpha=weight)
+            del initial_xpu, first_xpu, teacher_xpu, positions_xpu, rollout_xpu
+            del micro_loss, micro_metrics
+        loss, metrics = loss_sum, metric_sums
         if any(p.grad is None for p in head.parameters()):
             raise FloatingPointError('Missing MTP gradient')
         grad_norm = torch.nn.utils.clip_grad_norm_(head.parameters(), 1.)
@@ -321,6 +358,8 @@ def main():
         overlap_values = packed_metrics[5 + a.depth:5 + 2 * a.depth]
         row = {
             'step': step, 'rollouts_seen': cursor, 'rollouts': len(indices),
+            'microbatch_rollouts': microbatch_size,
+            'vocabulary_chunk': a.vocabulary_chunk,
             'labels_covered': len(indices) * a.depth, 'loss': loss_value,
             'verifier_nll': nll_value,
             'expected_accepted_length': expected_value,
@@ -374,6 +413,7 @@ def main():
         'dataset_sha256': dataset_sha, 'parent': parent_eval, 'best': best,
         'evaluations': evaluations, 'changed_native_parameters': changed,
         'optimizer': optimizer_name, 'lr': a.lr, 'ce_weight': a.ce_weight,
+        'microbatch_rollouts': a.microbatch_rollouts or a.batch_rollouts,
         'optimizer_reset_at_global_step': optimizer_reset_at_step,
         'batch_rollouts': a.batch_rollouts,
         'elapsed_seconds_including_evaluation_and_checkpoints': time.monotonic() - started,
