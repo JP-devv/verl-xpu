@@ -120,8 +120,9 @@ def main():
     top_error = float((top_values - dense_values).detach().abs().max())
     top_grad_error = float((htop.grad.float() - hdense.grad.float()).abs().max())
     same_support = torch.equal(top_ids.sort(dim=-1).values, dense_ids.sort(dim=-1).values)
-    assert same_support and top_error < 1e-6 and top_grad_error < 0.002, (
-        same_support, top_error, top_grad_error
+    same_top1 = torch.equal(top_ids[:, 0], dense_ids[:, 0])
+    assert same_support and same_top1 and top_error < 1e-6 and top_grad_error < 0.002, (
+        same_support, same_top1, top_error, top_grad_error
     )
 
     # A real six-position loss returns hard greedy acceptance separately from
@@ -161,6 +162,10 @@ def main():
         assert torch.equal(initial_fixture[0], hidden[1])
         assert torch.equal(teacher_fixture[0], hidden[2:8])
         assert position_fixture[0].tolist() == list(range(102, 108))
+        again = store.batch([0])
+        assert store.validated_input_ids == {0}
+        assert torch.equal(again[0], initial_fixture)
+        assert torch.equal(again[2], teacher_fixture)
         assert torch.equal(store.continuation_batch([0], 'cpu')[0], torch.tensor(ids[3:9]))
 
     # Exact rejection-sampling overlap is one for identical filtered policies.

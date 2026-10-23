@@ -94,7 +94,10 @@ def verifier_rollout_loss(head, initial_hidden, first_tokens, verifier_hidden,
         target = target_ids[:, 0]
         nll = label_nll(state, target, projection)
         with torch.no_grad():
-            draft_top1 = projection.topk(state, 1)[1].squeeze(-1)
+            # ``draft_ids`` is already the exact streamed top-k for this state.
+            # Its first column is the greedy token, so another full-vocabulary
+            # projection scan here only recomputes the same argmax.
+            draft_top1 = draft_ids[:, 0]
             hard_matches.append(draft_top1.eq(target))
         nlls.append(nll)
         recurrent_hidden = state
@@ -201,6 +204,7 @@ class RolloutFeatureStore:
             raise ValueError('depth and stride must be positive')
         self.rows = []
         self.selected_labels = self.covered_labels = 0
+        self.validated_input_ids = set()
         for record_index, record in enumerate(records):
             self.selected_labels += record['n_tgt']
             for lo, hi in record['spans']:
@@ -231,17 +235,23 @@ class RolloutFeatureStore:
             record = self.records[record_index]
             with safe_open(str(self.captures / (capture_key(record) + '.safetensors')),
                            framework='pt', device='cpu') as source:
-                ids = source.get_tensor('input_ids').long()
-                if ids.tolist() != record['input_ids']:
-                    raise ValueError('Capture token alignment mismatch')
+                # Check the saved token alignment on first use only. Re-reading
+                # and converting a long CPU token vector to Python ints on each
+                # minibatch creates substantial CPU and disk overhead when each
+                # conversation contributes many rollout windows.
+                if record_index not in self.validated_input_ids:
+                    ids = source.get_tensor('input_ids').long()
+                    if ids.tolist() != record['input_ids']:
+                        raise ValueError('Capture token alignment mismatch')
+                    self.validated_input_ids.add(record_index)
                 h = source.get_slice('hidden')
-                if h.get_shape() != [len(ids), self.hidden]:
+                if h.get_shape() != [len(record['input_ids']), self.hidden]:
                     raise ValueError('Capture hidden shape mismatch')
                 crop = record.get('capture_crop_start', 0)
                 for output_index, start in items:
                     initial[output_index].copy_(h[start - 2:start - 1].squeeze(0))
                     teacher[output_index].copy_(h[start - 1:start - 1 + depth])
-                    first_tokens[output_index] = ids[start - 1]
+                    first_tokens[output_index] = record['input_ids'][start - 1]
                     positions[output_index] = torch.arange(
                         crop + start - 1, crop + start - 1 + depth, dtype=torch.long
                     )
