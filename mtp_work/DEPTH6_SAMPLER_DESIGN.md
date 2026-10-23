@@ -51,6 +51,12 @@ The next bounded run produced a real optimizer checkpoint at step **32** after *
 
 The full captured pass resumes from `rollout-latest.pt`, preserving optimizer state and deterministic rollout order when continuing with the same optimizer. To reduce repeated validation overhead and HDD write pressure, resumed runs reuse the saved parent baseline instead of recomputing it, checkpoint every 64 optimizer updates, and evaluate the 675-rollout held-out set every 128 updates. A live test must load the exact depth-6 candidate hash and retain the production sampling policy; do not treat this step-32 proxy as a live result.
 
+## Host-memory changes for the full pass
+
+The captured manifest contains 2,103 records and 4,306,807 token IDs. Keeping every ID as a Python integer in a list is estimated to use about 148 MiB for list slots and integer objects; the trainer now converts each row to uint32 storage as it is read, about 16.4 MiB total. The rollout index also stores its 128,512 `(record, start)` pairs in compact uint32 arrays and removes an unused reverse index. These changes preserve token values and deterministic row order while reducing persistent host metadata.
+
+The depth-6 smoke stopped while serializing a multi-gigabyte checkpoint to the slow HDD. The checkpoint writer now syncs every 64 MiB so completed writes become reclaimable instead of accumulating as dirty page cache until the full archive is written. CPU tests verify torch checkpoint round-trip and the sampler rollout/capture alignment. The full checkpoint write, disk throughput, and AI01 memory relief remain unmeasured; a bounded run must record them before continuing the full pass.
+
 ## Memory-constrained optimizer migration
 
 The current bounded depth-6 trainer used AdamW. A prior XPU trial ran two updates on the same 424,699,392-parameter native head with fixed-rate, no-momentum factored Adafactor; peak XPU allocation was 5,132,628,480 bytes. That trial used the earlier one-step objective, so it establishes optimizer/device compatibility and a memory-saving candidate, not depth-6 convergence or speed.

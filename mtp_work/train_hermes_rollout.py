@@ -6,6 +6,7 @@ same native parent tensors but trains the deployed recurrent MTP layer to
 maximize filtered target/draft distribution overlap across six positions.
 """
 import argparse
+from array import array
 import gc
 import hashlib
 import json
@@ -23,6 +24,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextRotaryEmbedd
 sys.path.insert(0, os.environ.get('HERMES_HELPERS', '/work/scripts'))
 from mtp_head import MTPHead
 from hermes_rollout import RolloutFeatureStore, verifier_rollout_loss
+from checkpoint_io import SyncingWriter
 
 from real_trial import TargetTensors
 from streamed_projection import StreamedGPTQHead
@@ -78,6 +80,8 @@ def main():
     p.add_argument('--resume', type=Path)
     p.add_argument('--feature-cache-mib', type=int, default=64)
     p.add_argument('--vocabulary-chunk', type=int, default=2048)
+    p.add_argument('--checkpoint-sync-mib', type=int, default=64,
+                   help='Bound dirty page-cache growth while saving to slow storage')
     p.add_argument('--empty-xpu-cache-every', type=int, default=0,
                    help='Release cached XPU allocations every N updates; 0 keeps allocator reuse enabled')
     p.add_argument('--optimizer', choices=('adamw', 'adafactor'), default='adamw')
@@ -96,7 +100,20 @@ def main():
     torch.xpu.set_device(0)
     torch.manual_seed(61141)
     a.out.mkdir(parents=True, exist_ok=True)
-    records = [json.loads(line) for line in a.windows.open()]
+    # Keep the corpus in compact 32-bit token arrays. The JSON parser briefly
+    # creates one Python-int list at a time, but retaining 4.3M Python integers
+    # costs roughly 150 MiB versus 16.4 MiB for uint32 storage.
+    records = []
+    with a.windows.open() as source:
+        for line in source:
+            record = json.loads(line)
+            ids = record['input_ids']
+            if any(token < 0 or token > 0xFFFFFFFF for token in ids):
+                raise ValueError('Input token ID does not fit uint32 storage')
+            record['input_ids'] = array('I', ids)
+            if record['input_ids'].itemsize != 4:
+                raise RuntimeError('Native unsigned int is not 32 bits')
+            records.append(record)
     train, val = [r for r in records if r['split'] == 'train'], [
         r for r in records if r['split'] == 'heldout'
     ]
@@ -202,7 +219,7 @@ def main():
 
     def save_checkpoint():
         path, temp = a.out / 'rollout-latest.pt', a.out / 'rollout-latest.pt.partial'
-        torch.save({
+        checkpoint = {
             'branch_sha': BRANCH_SHA, 'dataset_sha256': dataset_sha,
             'objective': 'sampler-overlap-depth6-expected-accepted-prefix-v1',
             'sampler': {'source': a.sampler_source, 'temperature': a.temperature,
@@ -213,9 +230,18 @@ def main():
             'model': head.state_dict(), 'optimizer': optimizer.state_dict(),
             'step': step, 'cursor': cursor, 'order': order, 'best': best,
             'evaluations': evaluations, 'parent_eval': parent_eval,
-        }, temp)
+        }
+        started_save = time.monotonic()
+        with temp.open('wb', buffering=0) as raw:
+            writer = SyncingWriter(raw, a.checkpoint_sync_mib * 1024**2)
+            torch.save(checkpoint, writer)
+            writer.flush()
+            write_bytes, sync_count = writer.total_bytes, writer.sync_count
         os.replace(temp, path)
-        emit('rollout_checkpoint_saved', step=step, rollouts=cursor, bytes=path.stat().st_size)
+        del checkpoint
+        emit('rollout_checkpoint_saved', step=step, rollouts=cursor,
+             bytes=path.stat().st_size, write_bytes=write_bytes,
+             sync_count=sync_count, checkpoint_seconds=time.monotonic() - started_save)
 
     if a.resume:
         saved = torch.load(a.resume, map_location='cpu', weights_only=True, mmap=True)

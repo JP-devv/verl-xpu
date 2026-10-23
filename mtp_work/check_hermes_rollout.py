@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU checks for exact recurrent cache use and the depth-6 acceptance loss."""
 import os
+from array import array
 from pathlib import Path
 import sys
 import tempfile
@@ -148,7 +149,7 @@ def main():
     with tempfile.TemporaryDirectory() as directory:
         ids = list(range(20, 34))
         record = {'sid': 'rollout-fixture', 'w': 'capture', 'split': 'train',
-                  'root_id': 'root-a', 'input_ids': ids, 'spans': [[3, 13]],
+                  'root_id': 'root-a', 'input_ids': array('I', ids), 'spans': [[3, 13]],
                   'n_tgt': 10, 'capture_crop_start': 100}
         hidden = torch.arange(len(ids) * cfg.hidden_size, dtype=torch.float16).reshape(
             len(ids), cfg.hidden_size
@@ -158,6 +159,8 @@ def main():
         store = RolloutFeatureStore([record], directory, cfg.hidden_size, depth=6)
         initial_fixture, first_fixture, teacher_fixture, position_fixture = store.batch([0])
         assert len(store) == 1 and store.covered_labels == 6 and store.uncovered_labels == 4
+        assert len(store.row_records) == len(store.row_starts) == 1
+        assert store.row_records.itemsize == store.row_starts.itemsize == 4
         assert first_fixture.tolist() == [ids[2]]
         assert torch.equal(initial_fixture[0], hidden[1])
         assert torch.equal(teacher_fixture[0], hidden[2:8])
@@ -167,6 +170,7 @@ def main():
         assert torch.equal(again[0], initial_fixture)
         assert torch.equal(again[2], teacher_fixture)
         assert torch.equal(store.continuation_batch([0], 'cpu')[0], torch.tensor(ids[3:9]))
+        assert torch.tensor(record['input_ids'][3:9], dtype=torch.long).tolist() == ids[3:9]
 
     # Exact rejection-sampling overlap is one for identical filtered policies.
     logits = torch.tensor([[5., 4., 3., 2.]])

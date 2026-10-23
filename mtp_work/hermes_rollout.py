@@ -7,6 +7,7 @@ top-k, and top-p filters; their overlap is the one-step rejection-sampling
 acceptance probability used to maximize expected accepted-prefix length.
 """
 from collections import defaultdict
+from array import array
 from pathlib import Path
 
 import torch
@@ -208,7 +209,11 @@ class RolloutFeatureStore:
         self.depth, self.stride = depth, stride or depth
         if self.depth <= 0 or self.stride <= 0:
             raise ValueError('depth and stride must be positive')
-        self.rows = []
+        # One Python tuple plus two Python integers per rollout costs tens of
+        # MiB at this corpus size. Store the same row mapping in two uint32
+        # arrays instead (record indexes and absolute starts are both <2^32).
+        self.row_records = array('I')
+        self.row_starts = array('I')
         self.selected_labels = self.covered_labels = 0
         self.validated_input_ids = set()
         for record_index, record in enumerate(records):
@@ -217,15 +222,15 @@ class RolloutFeatureStore:
                 if lo < 2 or hi <= lo or hi > len(record['input_ids']):
                     raise ValueError('Invalid rollout span')
                 for start in range(lo, hi - self.depth + 1, self.stride):
-                    self.rows.append((record_index, start))
+                    if record_index > 0xFFFFFFFF or start > 0xFFFFFFFF:
+                        raise ValueError('Rollout index exceeds compact row storage')
+                    self.row_records.append(record_index)
+                    self.row_starts.append(start)
                     self.covered_labels += self.depth
         self.uncovered_labels = self.selected_labels - self.covered_labels
-        self.by_record = defaultdict(list)
-        for row_index, (record_index, _) in enumerate(self.rows):
-            self.by_record[record_index].append(row_index)
 
     def __len__(self):
-        return len(self.rows)
+        return len(self.row_records)
 
     def batch(self, row_indices, device='cpu'):
         count, depth = len(row_indices), self.depth
@@ -235,7 +240,8 @@ class RolloutFeatureStore:
         positions = torch.empty((count, depth), dtype=torch.long)
         groups = defaultdict(list)
         for output_index, row_index in enumerate(row_indices):
-            record_index, start = self.rows[row_index]
+            record_index = self.row_records[row_index]
+            start = self.row_starts[row_index]
             groups[record_index].append((output_index, start))
         for record_index, items in groups.items():
             record = self.records[record_index]
@@ -247,7 +253,7 @@ class RolloutFeatureStore:
                 # conversation contributes many rollout windows.
                 if record_index not in self.validated_input_ids:
                     ids = source.get_tensor('input_ids').long()
-                    if ids.tolist() != record['input_ids']:
+                    if ids.tolist() != list(record['input_ids']):
                         raise ValueError('Capture token alignment mismatch')
                     self.validated_input_ids.add(record_index)
                 h = source.get_slice('hidden')
@@ -268,7 +274,8 @@ class RolloutFeatureStore:
         """Observed continuation tokens, aligned to the captured verifier states."""
         tokens = torch.empty((len(row_indices), self.depth), dtype=torch.long)
         for out_index, row_index in enumerate(row_indices):
-            record_index, start = self.rows[row_index]
+            record_index = self.row_records[row_index]
+            start = self.row_starts[row_index]
             tokens[out_index] = torch.tensor(
                 self.records[record_index]['input_ids'][start:start + self.depth],
                 dtype=torch.long,
