@@ -157,7 +157,7 @@ def main():
         head.train()
         return result
 
-    parent_eval = evaluate('untrained_parent')
+    parent_eval = None
 
     def save_checkpoint():
         path, temp = a.out / 'rollout-latest.pt', a.out / 'rollout-latest.pt.partial'
@@ -187,10 +187,13 @@ def main():
         optimizer.load_state_dict(saved['optimizer'])
         step, cursor = saved['step'], saved['cursor']
         best, evaluations = saved['best'], saved['evaluations']
+        parent_eval = saved['parent_eval']
         del saved
         gc.collect()
         torch.xpu.empty_cache()
         emit('rollout_checkpoint_reloaded', step=step, rollouts=cursor)
+    else:
+        parent_eval = evaluate('untrained_parent')
 
     started = time.monotonic()
     log = (a.out / 'rollout-updates.jsonl').open('a')
