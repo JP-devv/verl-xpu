@@ -141,19 +141,55 @@ def distribution_overlap(target_ids, target_probs, target_keep,
     return (minimum * both.to(minimum.dtype)).sum(dim=(1, 2))
 
 
+class StreamedTopK(torch.autograd.Function):
+    """Vocabulary-blocked top-k with recomputed hidden-only backward.
+
+    Saving every block's dequantized vocabulary matrix in an ordinary linear
+    autograd graph costs multiple dense vocabulary copies per rollout depth.
+    This function saves only hidden states and selected token IDs, then reloads
+    the needed blocks during backward.
+    """
+    @staticmethod
+    def forward(ctx, hidden, projection, k):
+        import torch.nn.functional as F
+        h = hidden.half()
+        best = torch.full((len(h), k), float('-inf'), device=h.device)
+        tokens = torch.full((len(h), k), -1, dtype=torch.long, device=h.device)
+        with torch.no_grad(), torch.autocast(h.device.type, enabled=False):
+            for start, end in projection.blocks():
+                logits = F.linear(h, projection.weight(start, end)).float()
+                values, ids = logits.topk(min(k, end - start), dim=-1)
+                ids = ids + start
+                merged, choose = torch.cat((best, values), dim=-1).topk(k, dim=-1)
+                tokens = torch.cat((tokens, ids), dim=-1).gather(1, choose)
+                best = merged
+        ctx.save_for_backward(h, tokens)
+        ctx.projection = projection
+        ctx.input_dtype = hidden.dtype
+        return best, tokens
+
+    @staticmethod
+    def backward(ctx, grad_values, _grad_tokens):
+        h, tokens = ctx.saved_tensors
+        gradient = torch.zeros_like(h)
+        for start, end in ctx.projection.blocks():
+            in_block = (tokens >= start) & (tokens < end)
+            if not in_block.any():
+                continue
+            weight = ctx.projection.weight(start, end)
+            for rank in range(tokens.shape[1]):
+                mask = in_block[:, rank]
+                if mask.any():
+                    local = (tokens[:, rank] - start).clamp(0, end - start - 1)
+                    selected = weight[local]
+                    gradient.add_(selected * grad_values[:, rank].to(selected.dtype)[:, None]
+                                  * mask.to(selected.dtype)[:, None])
+        return gradient.to(ctx.input_dtype), None, None
+
+
 def topk_with_grad(hidden, projection, k):
-    """Stream vocabulary blocks while retaining gradients through selected logits."""
-    import torch.nn.functional as F
-    best = torch.full((len(hidden), k), float('-inf'), device=hidden.device)
-    tokens = torch.full((len(hidden), k), -1, dtype=torch.long, device=hidden.device)
-    for start, end in projection.blocks():
-        logits = F.linear(hidden.half(), projection.weight(start, end)).float()
-        values, ids = logits.topk(min(k, end - start), dim=-1)
-        ids = ids + start
-        merged, choose = torch.cat((best, values), dim=-1).topk(k, dim=-1)
-        tokens = torch.cat((tokens, ids), dim=-1).gather(1, choose)
-        best = merged
-    return best, tokens
+    """Return exact streamed top-k logits with a bounded-memory custom gradient."""
+    return StreamedTopK.apply(hidden, projection, k)
 
 
 class RolloutFeatureStore:

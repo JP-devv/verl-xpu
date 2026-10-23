@@ -18,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT / 'scripts'))
 
 from hermes_rollout import (RolloutFeatureStore, distribution_overlap,
-                            filtered_topk_probs, label_nll, verifier_rollout_loss)
+                            filtered_topk_probs, label_nll, topk_with_grad,
+                            verifier_rollout_loss)
 from mtp_head import MTPHead
 from train_hermes_capture import FrozenProjection
 from hermes_feature_store import capture_key
@@ -107,6 +108,22 @@ def main():
     grad_error = float((h.grad.float() - href.grad.float()).abs().max())
     assert nll_error < 2e-5 and grad_error < 0.002, (nll_error, grad_error)
 
+    # Blocked top-k backward matches dense selected-logit gradients without
+    # retaining the full vocabulary's block matrices in the graph.
+    htop = torch.randn(5, cfg.hidden_size, dtype=torch.bfloat16, requires_grad=True)
+    hdense = htop.detach().clone().requires_grad_(True)
+    top_values, top_ids = topk_with_grad(htop, projection, 20)
+    dense_values, dense_ids = F.linear(hdense.half(), frozen.weight).float().topk(20, dim=-1)
+    top_grad = torch.ones_like(top_values)
+    (top_values * top_grad).sum().backward()
+    (dense_values * top_grad).sum().backward()
+    top_error = float((top_values - dense_values).detach().abs().max())
+    top_grad_error = float((htop.grad.float() - hdense.grad.float()).abs().max())
+    same_support = torch.equal(top_ids.sort(dim=-1).values, dense_ids.sort(dim=-1).values)
+    assert same_support and top_error < 1e-6 and top_grad_error < 0.002, (
+        same_support, top_error, top_grad_error
+    )
+
     # A real six-position loss returns hard greedy acceptance separately from
     # its smooth expected-accepted-length surrogate and propagates finite grads.
     head.zero_grad(set_to_none=True)
@@ -156,6 +173,7 @@ def main():
     assert 0 <= float(metrics['expected_accepted']) <= depth
     print({'pass': True, 'depth': depth, 'cache_max_abs_error': cache_error,
            'streamed_nll_max_error': nll_error, 'streamed_nll_grad_max_error': grad_error,
+           'streamed_topk_max_error': top_error, 'streamed_topk_grad_max_error': top_grad_error,
            'hard_accepted_length': float(metrics['hard_accepted_length']),
            'expected_accepted': float(metrics['expected_accepted']),
            'trainable_tensors': len(list(head.parameters())),
