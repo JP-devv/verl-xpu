@@ -86,14 +86,15 @@ def verifier_rollout_loss(head, initial_hidden, first_tokens, verifier_hidden,
         with torch.no_grad():
             target_logits, target_ids = projection.topk(verifier_hidden[:, step], top_k)
             target_probs, target_keep = filtered_topk_probs(target_logits, temperature, top_p)
-        draft_logits, draft_ids = topk_with_grad(state, projection, top_k)
+        target = target_ids[:, 0]
+        draft_logits, draft_ids, nll = topk_with_grad_and_nll(
+            state, projection, top_k, target
+        )
         draft_probs, draft_keep = filtered_topk_probs(draft_logits, temperature, top_p)
         overlaps.append(distribution_overlap(
             target_ids, target_probs, target_keep,
             draft_ids, draft_probs, draft_keep,
         ))
-        target = target_ids[:, 0]
-        nll = label_nll(state, target, projection)
         with torch.no_grad():
             # ``draft_ids`` is already the exact streamed top-k for this state.
             # Its first column is the greedy token, so another full-vocabulary
@@ -200,6 +201,76 @@ class StreamedTopK(torch.autograd.Function):
 def topk_with_grad(hidden, projection, k):
     """Return exact streamed top-k logits with a bounded-memory custom gradient."""
     return StreamedTopK.apply(hidden, projection, k)
+
+
+class StreamedTopKAndNLL(torch.autograd.Function):
+    """Compute draft top-k and target NLL in one vocabulary-block pass."""
+    @staticmethod
+    def forward(ctx, hidden, projection, k, labels):
+        import torch.nn.functional as F
+        h = hidden.half()
+        best = torch.full((len(h), k), float('-inf'), device=h.device)
+        tokens = torch.full((len(h), k), -1, dtype=torch.long, device=h.device)
+        lse = torch.full((len(h),), float('-inf'), device=h.device, dtype=torch.float32)
+        target_logit = torch.zeros_like(lse)
+        rows = torch.arange(len(h), device=h.device)
+        with torch.no_grad(), torch.autocast(h.device.type, enabled=False):
+            for start, end in projection.blocks():
+                logits = F.linear(h, projection.weight(start, end)).float()
+                lse = torch.logaddexp(lse, logits.logsumexp(-1))
+                valid = (labels >= start) & (labels < end)
+                local = (labels - start).clamp(0, end - start - 1)
+                target_logit += torch.where(valid, logits[rows, local], 0.)
+                values, ids = logits.topk(min(k, end - start), dim=-1)
+                ids = ids + start
+                merged, choose = torch.cat((best, values), dim=-1).topk(k, dim=-1)
+                tokens = torch.cat((tokens, ids), dim=-1).gather(1, choose)
+                best = merged
+        ctx.save_for_backward(h, tokens, labels, lse)
+        ctx.projection = projection
+        ctx.input_dtype = hidden.dtype
+        return best, tokens, lse - target_logit
+
+    @staticmethod
+    def backward(ctx, grad_values, _grad_tokens, grad_nll):
+        import torch.nn.functional as F
+        h, tokens, labels, lse = ctx.saved_tensors
+        nll_gradient = torch.zeros_like(h, dtype=torch.float32)
+        topk_gradient = torch.zeros_like(h)
+        with torch.autocast(h.device.type, enabled=False):
+            for start, end in ctx.projection.blocks():
+                weight = ctx.projection.weight(start, end)
+                logits = F.linear(h, weight).float()
+                prob = (logits - lse[:, None]).exp()
+                valid = (labels >= start) & (labels < end)
+                local = (labels - start).clamp(0, end - start - 1)
+                prob.scatter_add_(1, local[:, None], -valid.float()[:, None])
+                if grad_nll is not None:
+                    prob.mul_(grad_nll.float()[:, None])
+                else:
+                    prob.zero_()
+                if grad_values is not None:
+                    rows, ranks = ((tokens >= start) & (tokens < end)).nonzero(as_tuple=True)
+                    local_tokens = tokens[rows, ranks] - start
+                    selected = weight[local_tokens]
+                    contributions = selected * grad_values[rows, ranks].to(
+                        selected.dtype
+                    )[:, None]
+                else:
+                    rows = local_tokens = contributions = None
+                nll_gradient.add_(F.linear(prob.half(), weight.t()).float())
+                if contributions is not None:
+                    topk_gradient.index_add_(0, rows, contributions)
+        # Match the two original custom operations' dtype rounding before the
+        # autograd engine accumulates their separate input gradients.
+        combined_gradient = (nll_gradient.to(ctx.input_dtype)
+                             + topk_gradient.to(ctx.input_dtype))
+        return combined_gradient, None, None, None
+
+
+def topk_with_grad_and_nll(hidden, projection, k, labels):
+    """Return exact streamed top-k values and target NLL from one block scan."""
+    return StreamedTopKAndNLL.apply(hidden, projection, k, labels)
 
 
 class RolloutFeatureStore:

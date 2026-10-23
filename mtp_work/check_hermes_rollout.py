@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 
 from hermes_rollout import (RolloutFeatureStore, distribution_overlap,
                             filtered_topk_probs, label_nll, topk_with_grad,
-                            verifier_rollout_loss)
+                            topk_with_grad_and_nll, verifier_rollout_loss)
 from mtp_head import MTPHead
 from train_hermes_capture import FrozenProjection
 from hermes_feature_store import capture_key
@@ -126,6 +126,39 @@ def main():
         same_support, same_top1, top_error, top_grad_error
     )
 
+    # The combined projection returns the same top-k and NLL as separate
+    # scans, with both gradients accumulating through one blocked backward.
+    hcombined = torch.randn(5, cfg.hidden_size, dtype=torch.bfloat16, requires_grad=True)
+    hcombined_ref = hcombined.detach()
+    labels_combined = torch.randint(0, cfg.vocab_size, (5,))
+    combined_values, combined_ids, combined_nll = topk_with_grad_and_nll(
+        hcombined, projection, 20, labels_combined
+    )
+    dense_combined_logits = F.linear(hcombined_ref.half(), frozen.weight).float()
+    dense_combined_values, dense_combined_ids = dense_combined_logits.topk(20, dim=-1)
+    dense_combined_nll = F.cross_entropy(dense_combined_logits, labels_combined,
+                                         reduction='none')
+    grad_values = torch.randn_like(combined_values)
+    grad_nll = torch.randn_like(combined_nll)
+    (combined_values.mul(grad_values).sum() + combined_nll.mul(grad_nll).sum()).backward()
+    combined_value_error = float((combined_values - dense_combined_values).detach().abs().max())
+    combined_nll_error = float((combined_nll - dense_combined_nll).detach().abs().max())
+    hseparate = hcombined.detach().clone().requires_grad_(True)
+    separate_values, _ = topk_with_grad(hseparate, projection, 20)
+    separate_nll = label_nll(hseparate, labels_combined, projection)
+    (separate_values.mul(grad_values).sum()
+     + separate_nll.mul(grad_nll).sum()).backward()
+    combined_separate_grad_error = float((hcombined.grad.float()
+                                          - hseparate.grad.float()).abs().max())
+    combined_support_match = torch.equal(combined_ids.sort(dim=-1).values,
+                                         dense_combined_ids.sort(dim=-1).values)
+    combined_top1_match = torch.equal(combined_ids[:, 0], dense_combined_ids[:, 0])
+    assert combined_support_match and combined_top1_match
+    assert combined_value_error < 1e-6 and combined_nll_error < 2e-5
+    assert combined_separate_grad_error < 0.0025, (
+        combined_value_error, combined_nll_error, combined_separate_grad_error
+    )
+
     # A real six-position loss returns hard greedy acceptance separately from
     # its smooth expected-accepted-length surrogate and propagates finite grads.
     head.zero_grad(set_to_none=True)
@@ -183,6 +216,8 @@ def main():
     print({'pass': True, 'depth': depth, 'cache_max_abs_error': cache_error,
            'streamed_nll_max_error': nll_error, 'streamed_nll_grad_max_error': grad_error,
            'streamed_topk_max_error': top_error, 'streamed_topk_grad_max_error': top_grad_error,
+           'combined_topk_nll_max_errors': [combined_value_error, combined_nll_error,
+                                            combined_separate_grad_error],
            'hard_accepted_length': float(metrics['hard_accepted_length']),
            'expected_accepted': float(metrics['expected_accepted']),
            'trainable_tensors': len(list(head.parameters())),
