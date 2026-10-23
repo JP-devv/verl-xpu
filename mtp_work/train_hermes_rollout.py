@@ -17,6 +17,7 @@ import time
 import torch
 from safetensors import safe_open
 from transformers import Qwen3_5Config
+from transformers.optimization import Adafactor
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextRotaryEmbedding
 
 sys.path.insert(0, os.environ.get('HERMES_HELPERS', '/work/scripts'))
@@ -28,6 +29,24 @@ from streamed_projection import StreamedGPTQHead
 from hermes_streamed_margin import FeatureOutput
 from train_hermes_capture import (BRANCH_SHA, SelectedEmbedding, emit, export_native,
                                   native_key, tensor_sha)
+
+
+ADAMW_NAME = 'AdamW'
+ADAFACTOR_NAME = 'Adafactor-factored-no-momentum'
+
+
+def validate_optimizer_resume(saved_name, current_name, reset_state):
+    """Permit only an explicit AdamW -> factored-Adafactor state reset."""
+    saved_name = saved_name or ADAMW_NAME  # pre-metadata rollout checkpoints used AdamW
+    if reset_state:
+        if saved_name == current_name:
+            raise ValueError('Optimizer reset requested without changing optimizers')
+        if not (saved_name == ADAMW_NAME and current_name == ADAFACTOR_NAME):
+            raise ValueError('Only the validated AdamW-to-Adafactor migration is supported')
+        return True
+    if saved_name != current_name:
+        raise ValueError('Checkpoint optimizer differs; use explicit optimizer reset to migrate')
+    return False
 
 
 def capture_digest(path):
@@ -54,12 +73,22 @@ def main():
     p.add_argument('--budget-s', type=int, default=3600)
     p.add_argument('--max-updates', type=int, default=0,
                    help='Explicit smoke only; never reports complete data training')
+    p.add_argument('--skip-smoke-eval', action='store_true',
+                   help='Skip full heldout sweep for a bounded optimizer smoke only')
     p.add_argument('--resume', type=Path)
     p.add_argument('--feature-cache-mib', type=int, default=64)
     p.add_argument('--vocabulary-chunk', type=int, default=2048)
     p.add_argument('--empty-xpu-cache-every', type=int, default=0,
                    help='Release cached XPU allocations every N updates; 0 keeps allocator reuse enabled')
+    p.add_argument('--optimizer', choices=('adamw', 'adafactor'), default='adamw')
+    p.add_argument('--reset-optimizer-on-resume', action='store_true',
+                   help=('Load model/data cursor but start fresh optimizer state; required '
+                         'when migrating a validated checkpoint to another optimizer'))
     a = p.parse_args()
+    if a.reset_optimizer_on_resume and not a.resume:
+        raise ValueError('--reset-optimizer-on-resume requires --resume')
+    if a.skip_smoke_eval and not a.max_updates:
+        raise ValueError('--skip-smoke-eval requires an explicit --max-updates bound')
     assert torch.xpu.is_available(), 'XPU required; no CPU/CUDA training fallback'
     if a.depth != 6:
         raise ValueError('This training recipe is defined for deployed draft depth 6')
@@ -115,8 +144,18 @@ def main():
          objective='depth6 filtered rejection-sampling overlap / expected accepted prefix',
          sampler={'source': a.sampler_source, 'temperature': a.temperature,
                   'top_k': a.top_k, 'top_p': a.top_p})
-    optimizer = torch.optim.AdamW(head.parameters(), lr=a.lr, foreach=False)
+    if a.optimizer == 'adamw':
+        optimizer = torch.optim.AdamW(head.parameters(), lr=a.lr, foreach=False)
+        optimizer_name = ADAMW_NAME
+    else:
+        # Factored second moments avoid AdamW's two full-size moment tensors.
+        # Fixed-step mode is intentional: no hidden relative-LR schedule.
+        optimizer = Adafactor(head.parameters(), lr=a.lr, scale_parameter=False,
+                              relative_step=False, warmup_init=False, beta1=None,
+                              weight_decay=0.)
+        optimizer_name = ADAFACTOR_NAME
     evaluations, best, step, cursor = [], None, 0, 0
+    optimizer_reset_at_step = None
     order = torch.randperm(len(train_store), generator=torch.Generator().manual_seed(61141)).tolist()
 
     @torch.no_grad()
@@ -169,6 +208,8 @@ def main():
             'sampler': {'source': a.sampler_source, 'temperature': a.temperature,
                         'top_k': a.top_k, 'top_p': a.top_p},
             'depth': a.depth, 'ce_weight': a.ce_weight, 'lr': a.lr,
+            'optimizer_name': optimizer_name,
+            'optimizer_reset_at_step': optimizer_reset_at_step,
             'model': head.state_dict(), 'optimizer': optimizer.state_dict(),
             'step': step, 'cursor': cursor, 'order': order, 'best': best,
             'evaluations': evaluations, 'parent_eval': parent_eval,
@@ -178,6 +219,7 @@ def main():
 
     if a.resume:
         saved = torch.load(a.resume, map_location='cpu', weights_only=True, mmap=True)
+        saved_optimizer_name = saved.get('optimizer_name', 'AdamW')
         if (saved['branch_sha'] != BRANCH_SHA or saved['dataset_sha256'] != dataset_sha
                 or saved['objective'] != 'sampler-overlap-depth6-expected-accepted-prefix-v1'
                 or saved['depth'] != a.depth or saved['ce_weight'] != a.ce_weight
@@ -185,15 +227,28 @@ def main():
                 or saved.get('sampler') != {'source': a.sampler_source, 'temperature': a.temperature,
                                              'top_k': a.top_k, 'top_p': a.top_p}):
             raise ValueError('Resume checkpoint does not match this rollout recipe and dataset')
+        optimizer_migration = validate_optimizer_resume(
+            saved_optimizer_name, optimizer_name, a.reset_optimizer_on_resume)
         head.load_state_dict(saved['model'], strict=True)
-        optimizer.load_state_dict(saved['optimizer'])
+        if not optimizer_migration:
+            optimizer.load_state_dict(saved['optimizer'])
         step, cursor = saved['step'], saved['cursor']
+        optimizer_reset_at_step = saved.get('optimizer_reset_at_step')
+        if optimizer_migration:
+            optimizer_reset_at_step = step
         best, evaluations = saved['best'], saved['evaluations']
         parent_eval = saved['parent_eval']
         del saved
         gc.collect()
         torch.xpu.empty_cache()
-        emit('rollout_checkpoint_reloaded', step=step, rollouts=cursor)
+        emit('rollout_checkpoint_reloaded', step=step, rollouts=cursor,
+             optimizer=optimizer_name,
+             optimizer_state='reset' if optimizer_migration else 'restored')
+        if optimizer_migration:
+            emit('optimizer_migrated', from_optimizer=saved_optimizer_name,
+                 to_optimizer=optimizer_name, at_global_step=step,
+                 optimizer_internal_step=0,
+                 rationale='factored optimizer state reduces memory; optimizer history explicitly reset')
     else:
         parent_eval = evaluate('untrained_parent')
 
@@ -261,7 +316,11 @@ def main():
         budget_stop = time.monotonic() - started >= a.budget_s
         smoke_stop = bool(a.max_updates and step >= a.max_updates)
         final = cursor == len(order)
-        if step % a.eval_every == 0 or final or budget_stop or smoke_stop:
+        skip_eval = smoke_stop and a.skip_smoke_eval and not final
+        if skip_eval:
+            emit('rollout_smoke_evaluation_skipped', step=step, rollouts=cursor,
+                 reason='bounded one-update optimizer smoke; full heldout sweep remains pending')
+        elif step % a.eval_every == 0 or final or budget_stop or smoke_stop:
             result = evaluate('trained')
             evaluations.append(result)
             if best is None or result['expected_accepted_length'] > best['expected_accepted_length']:
@@ -288,7 +347,8 @@ def main():
         'uncovered_capture_labels': train_store.uncovered_labels,
         'dataset_sha256': dataset_sha, 'parent': parent_eval, 'best': best,
         'evaluations': evaluations, 'changed_native_parameters': changed,
-        'optimizer': 'AdamW', 'lr': a.lr, 'ce_weight': a.ce_weight,
+        'optimizer': optimizer_name, 'lr': a.lr, 'ce_weight': a.ce_weight,
+        'optimizer_reset_at_global_step': optimizer_reset_at_step,
         'batch_rollouts': a.batch_rollouts,
         'elapsed_seconds_including_evaluation_and_checkpoints': time.monotonic() - started,
         'peak_xpu_bytes': torch.xpu.max_memory_allocated(0),
