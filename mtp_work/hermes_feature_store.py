@@ -8,12 +8,39 @@ allocation or accelerator feature cache is constructed.
 from bisect import bisect_right
 from collections import OrderedDict
 import hashlib
+import os
 from pathlib import Path
 
 import torch
 from safetensors import safe_open
 
 SCHEDULE = 'shuffled-capture-and-within-capture-v1'
+
+
+def discard_clean_file_cache(path):
+    """Advise Linux to drop clean pages after a capture shard has been copied.
+
+    Captures are read-only and each shard is traversed once per epoch. The
+    bounded feature cache owns the selected rows needed by training, so keeping
+    every touched safetensors page in the container's file cache only competes
+    with model and optimizer memory. This is an advisory optimization; missing
+    support or a filesystem error must not affect training correctness.
+    """
+    advice = getattr(os, 'POSIX_FADV_DONTNEED', None)
+    advise = getattr(os, 'posix_fadvise', None)
+    if advice is None or advise is None:
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        advise(fd, 0, 0, advice)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return True
 
 
 def capture_key(record):
@@ -55,7 +82,8 @@ class BoundedFeatureStore:
         features = torch.empty((count, self.hidden), dtype=torch.float16)
         tokens = torch.empty(count, dtype=torch.long)
         labels = torch.empty_like(tokens)
-        with safe_open(str(self.captures / (capture_key(record) + '.safetensors')),
+        capture_path = self.captures / (capture_key(record) + '.safetensors')
+        with safe_open(str(capture_path),
                        framework='pt', device='cpu') as source:
             ids = source.get_tensor('input_ids').long()
             if ids.tolist() != record['input_ids']:
@@ -75,6 +103,9 @@ class BoundedFeatureStore:
                 previous_end = hi
             if cursor != count:
                 raise ValueError('Selected label count differs from capture mask')
+        # Drop clean source pages only after the safetensors mapping is closed
+        # and all selected values have been copied into the bounded host cache.
+        self.last_cache_advice_succeeded = discard_clean_file_cache(capture_path)
         # Keep cached rows in source order. Permuting only requested batches
         # avoids a second capture-sized feature allocation during shuffling.
         value = (features, tokens, labels)

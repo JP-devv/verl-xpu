@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Independent CPU fixture for bounded feature coverage, resume and eviction."""
 import json
+import os
 from pathlib import Path
 import tempfile
 
@@ -33,6 +34,8 @@ def main():
             got.extend(zip(h[:,0].tolist(),t.tolist(),y.tolist()))
         assert sorted(got)==sorted(expected) and len(got)==len(set(got))==42
         assert store.peak_cached_bytes==bound and len(store.cache)==1
+        if hasattr(os, 'posix_fadvise') and hasattr(os, 'POSIX_FADV_DONTNEED'):
+            assert store.last_cache_advice_succeeded
         resumed = BoundedFeatureStore(records,directory,4,max_cache_bytes=bound)
         h,t,y = resumed.batch(17,31)
         assert list(zip(h[:,0].tolist(),t.tolist(),y.tolist()))==got[17:31]
