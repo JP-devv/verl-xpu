@@ -200,10 +200,13 @@ def main():
     started = time.monotonic()
     log = (a.out / 'rollout-updates.jsonl').open('a')
     while cursor < len(order):
+        update_t0 = time.monotonic()
+        update_cpu_t0 = time.process_time()
         lo, hi = cursor, min(cursor + a.batch_rollouts, len(order))
         indices = order[lo:hi]
         initial, first, teacher, positions = train_store.batch(indices, device)
         rollout_tokens = train_store.continuation_batch(indices, device)
+        data_seconds = time.monotonic() - update_t0
         optimizer.zero_grad(set_to_none=True)
         t0 = time.monotonic()
         with torch.autocast('xpu', dtype=torch.bfloat16):
@@ -243,7 +246,11 @@ def main():
             'hard_greedy_accepted_length': hard_value,
             'per_depth_prefix_acceptance': prefix_values,
             'per_depth_sampler_overlap': overlap_values,
-            'grad_norm': grad_norm_value, 'seconds': time.monotonic() - t0,
+            'grad_norm': grad_norm_value,
+            'data_seconds': data_seconds,
+            'compute_seconds': time.monotonic() - t0,
+            'cpu_seconds': time.process_time() - update_cpu_t0,
+            'seconds': time.monotonic() - update_t0,
         }
         log.write(json.dumps(row) + '\n'); log.flush()
         if step == 1 or step % 10 == 0:
