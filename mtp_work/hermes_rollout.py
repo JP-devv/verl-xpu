@@ -175,18 +175,24 @@ class StreamedTopK(torch.autograd.Function):
     def backward(ctx, grad_values, _grad_tokens):
         h, tokens = ctx.saved_tensors
         gradient = torch.zeros_like(h)
-        for start, end in ctx.projection.blocks():
-            in_block = (tokens >= start) & (tokens < end)
-            if not in_block.any():
-                continue
+        if grad_values is None:
+            return gradient.to(ctx.input_dtype), None, None
+        # Avoid per-block/per-rank ``if tensor.any()`` checks: on XPU each
+        # Python condition synchronizes the device. The top-k IDs are small,
+        # so transfer their block indices once, then gather only active rows.
+        chunk = ctx.projection.chunk
+        active_blocks = torch.unique(
+            torch.div(tokens.detach().cpu().reshape(-1), chunk, rounding_mode='floor')
+        ).tolist()
+        for block_index in active_blocks:
+            start = block_index * chunk
+            end = min(start + chunk, ctx.projection.n_out)
+            rows, ranks = ((tokens >= start) & (tokens < end)).nonzero(as_tuple=True)
             weight = ctx.projection.weight(start, end)
-            for rank in range(tokens.shape[1]):
-                mask = in_block[:, rank]
-                if mask.any():
-                    local = (tokens[:, rank] - start).clamp(0, end - start - 1)
-                    selected = weight[local]
-                    gradient.add_(selected * grad_values[:, rank].to(selected.dtype)[:, None]
-                                  * mask.to(selected.dtype)[:, None])
+            local = tokens[rows, ranks] - start
+            selected = weight[local]
+            contributions = selected * grad_values[rows, ranks].to(selected.dtype)[:, None]
+            gradient.index_add_(0, rows, contributions)
         return gradient.to(ctx.input_dtype), None, None
 
 

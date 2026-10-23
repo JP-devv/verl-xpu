@@ -57,6 +57,8 @@ def main():
     p.add_argument('--resume', type=Path)
     p.add_argument('--feature-cache-mib', type=int, default=64)
     p.add_argument('--vocabulary-chunk', type=int, default=2048)
+    p.add_argument('--empty-xpu-cache-every', type=int, default=0,
+                   help='Release cached XPU allocations every N updates; 0 keeps allocator reuse enabled')
     a = p.parse_args()
     assert torch.xpu.is_available(), 'XPU required; no CPU/CUDA training fallback'
     if a.depth != 6:
@@ -213,29 +215,42 @@ def main():
         if not torch.isfinite(loss):
             raise FloatingPointError('Non-finite verifier-rollout objective')
         loss.backward()
-        if not all(p.grad is not None and torch.isfinite(p.grad).all() for p in head.parameters()):
-            raise FloatingPointError('Missing or non-finite MTP gradient')
+        if any(p.grad is None for p in head.parameters()):
+            raise FloatingPointError('Missing MTP gradient')
         grad_norm = torch.nn.utils.clip_grad_norm_(head.parameters(), 1.)
-        torch.xpu.empty_cache()
+        if not torch.isfinite(grad_norm):
+            raise FloatingPointError('Non-finite aggregate MTP gradient norm')
         optimizer.step()
-        torch.xpu.synchronize(0)
         step += 1
         cursor = hi
+        # Pull scalar and per-depth metrics to CPU in one transfer. Several
+        # separate float()/tolist() calls each synchronize the XPU stream.
+        packed_metrics = torch.cat((
+            torch.stack((loss.detach(), metrics['nll'],
+                         metrics['expected_accepted'], metrics['hard_accepted_length'],
+                         grad_norm)).reshape(-1),
+            metrics['per_depth_prefix_acceptance'].reshape(-1),
+            metrics['per_depth_sampler_overlap'].reshape(-1),
+        )).cpu().tolist()
+        loss_value, nll_value, expected_value, hard_value, grad_norm_value = packed_metrics[:5]
+        prefix_values = packed_metrics[5:5 + a.depth]
+        overlap_values = packed_metrics[5 + a.depth:5 + 2 * a.depth]
         row = {
             'step': step, 'rollouts_seen': cursor, 'rollouts': len(indices),
-            'labels_covered': len(indices) * a.depth, 'loss': float(loss.detach()),
-            'verifier_nll': float(metrics['nll']),
-            'expected_accepted_length': float(metrics['expected_accepted']),
-            'hard_greedy_accepted_length': float(metrics['hard_accepted_length']),
-            'per_depth_prefix_acceptance': metrics['per_depth_prefix_acceptance'].tolist(),
-            'per_depth_sampler_overlap': metrics['per_depth_sampler_overlap'].tolist(),
-            'grad_norm': float(grad_norm), 'seconds': time.monotonic() - t0,
+            'labels_covered': len(indices) * a.depth, 'loss': loss_value,
+            'verifier_nll': nll_value,
+            'expected_accepted_length': expected_value,
+            'hard_greedy_accepted_length': hard_value,
+            'per_depth_prefix_acceptance': prefix_values,
+            'per_depth_sampler_overlap': overlap_values,
+            'grad_norm': grad_norm_value, 'seconds': time.monotonic() - t0,
         }
         log.write(json.dumps(row) + '\n'); log.flush()
         if step == 1 or step % 10 == 0:
             emit('rollout_update', **row)
         del initial, first, teacher, positions, rollout_tokens, loss
-        torch.xpu.empty_cache()
+        if a.empty_xpu_cache_every and step % a.empty_xpu_cache_every == 0:
+            torch.xpu.empty_cache()
         budget_stop = time.monotonic() - started >= a.budget_s
         smoke_stop = bool(a.max_updates and step >= a.max_updates)
         final = cursor == len(order)
